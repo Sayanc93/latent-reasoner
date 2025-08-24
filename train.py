@@ -3,19 +3,6 @@
 """
 GSPO/GRPO + Coconut-style Latent Steps on GSM8K (minimal, readable)
 -------------------------------------------------------------------
-Key fixes vs your draft:
-1) Visible decoding now APPENDS sampled tokens to input_ids every step.
-2) Latent loop sampling uses its OWN logits (out_lat.logits) and gates over {<latent>, </latent>}.
-3) Implemented local `sample_from_logits` (temp + top_p), removed external dependency.
-4) Added `extract_pred_number` and robust numeric parsing; rewards use parsed numbers.
-5) Latent stats are tracked cleanly; rewards price visible and latent steps.
-6) Generation code is device-safe and cache-efficient (use_cache + inputs_embeds).
-7) Trainer wrapper relies on TRL GRPOTrainer hooks; if your TRL exposes `train()`
-   instead of `train_epoch()`, we detect and use it. Sequence-level reward still works.
-
-NOTE: This uses TRL's GRPOTrainer as a stand-in. If you have a GSPO trainer with
-sequence-level clipping, you can swap the base class; the latent generator and
-reward plumbing stay the same.
 """
 
 import argparse
@@ -44,9 +31,9 @@ ANS_OPEN     = "<answer>"
 ANS_CLOSE    = "</answer>"
 
 SYSTEM_PROMPT = (
-    "You are a helpful assistant. The reasoning process and answer are enclosed within "
+    "You are a helpful assistant. The reasoning process and the final answer are enclosed within "
     "<thinking> </thinking> and <answer> </answer> tags, respectively. "
-    "You may use <latent> </latent> tags to ponder.\n"
+    "You may use <latent> </latent> blocks inside <thinking> </thinking> to ponder.\n"
     "Respond STRICTLY in this XML format.\n"
 )
 
@@ -270,29 +257,79 @@ class LatentReasoningTrainer(GRPOTrainer):
         self._latest_latent_stats = stats
         return completions, completion_ids
 
-    # 2) Compute compute-aware numeric rewards (correctness + structure - compute)
-    def compute_rewards(self, *, prompts=None, completions=None, completions_ids=None, **kwargs):
-        golds = kwargs.get("answer", [None] * len(completions))
-        rewards = []
-        for txt, gold, st in zip(completions, golds, self._latest_latent_stats):
-            pred_str = extract_pred_number(txt)
-            gold_val = _to_number(gold) if gold is not None else None
-            pred_val = _to_number(pred_str) if pred_str is not None else None
+# ---------------------------- Reward functions ---------------------------- #
 
-            correct = 1.0 if (gold_val is not None and pred_val is not None and abs(pred_val - gold_val) < 1e-6) else 0.0
-            structure = 0.2 if (THINK_OPEN in txt and THINK_CLOSE in txt and ANS_OPEN in txt and ANS_CLOSE in txt) else 0.0
-            r = 2.0 * correct + structure - self.lam_visible * st["n_visible"] - self.lam_latent * st["n_latent"]
-            rewards.append(float(r))
-        return rewards
+# #Compute compute-aware numeric rewards (correctness + structure - compute)
+# def compute_rewards(self, *, prompts=None, completions=None, completions_ids=None, **kwargs):
+#     golds = kwargs.get("answer", [None] * len(completions))
+#     rewards = []
+#     for txt, gold, st in zip(completions, golds, self._latest_latent_stats):
+#         pred_str = extract_pred_number(txt)
+#         gold_val = _to_number(gold) if gold is not None else None
+#         pred_val = _to_number(pred_str) if pred_str is not None else None
+
+#         correct = 1.0 if (gold_val is not None and pred_val is not None and abs(pred_val - gold_val) < 1e-6) else 0.0
+#         structure = 0.2 if (THINK_OPEN in txt and THINK_CLOSE in txt and ANS_OPEN in txt and ANS_CLOSE in txt) else 0.0
+#         r = 2.0 * correct + structure - self.lam_visible * st["n_visible"] - self.lam_latent * st["n_latent"]
+#         rewards.append(float(r))
+#     return rewards
+
+# Format check regex for <thinking> ... </thinking>
+THINK_BLOCK = re.compile(r"(?is)<thinking>\s*(.*?)\s*</thinking>")
+
+def _has_well_formed_xml(text: str) -> bool:
+    t = THINK_BLOCK.search(text)
+    a = ANS_BLOCK.search(text)
+    if not (t and a):
+        return False
+    return bool(t.group(1).strip()) and bool(a.group(1).strip())
+
+def reward_format(*, completions=None, **kwargs):
+    # +0.2 if both <thinking>...</thinking> and <answer>...</answer> blocks exist and are non-empty
+    scores = []
+    for txt in completions:
+        scores.append(0.2 if _has_well_formed_xml(txt[0]) else 0.0)
+    return scores
+
+def strict_format_reward(*, completions=None, **kwargs):
+    """Reward function that checks if the completion has a specific format."""
+    pattern = r"^<thinking>\n.*?\n</thinking>\n<answer>\n.*?\n</answer>\n$"
+    responses = [completion[0]["content"] for completion in completions]
+    matches = [re.match(pattern, r, flags=re.DOTALL) for r in responses] 
+    return [0.5 if match else 0.0 for match in matches]
+
+def int_reward(*, completions=None, **kwargs):
+    responses = [completion[0]['content'] for completion in completions]
+    extracted_responses = [ANS_BLOCK.search(r) for r in responses]
+    return [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
+
+def reward_accuracy(*, completions=None, answer=None, **kwargs):
+    # +2.0 if numeric answer matches gold (within tolerance)
+    golds = answer or [None] * len(completions)
+    scores = []
+    for txt, gold in zip(completions, golds):
+        pred_str = extract_pred_number(txt[0])
+        gold_val = _to_number(gold) if gold is not None else None
+        pred_val = _to_number(pred_str) if pred_str is not None else None
+        scores.append(2.0 if gold_val is not None and pred_val is not None and pred_val == gold_val else 0.0)
+    return scores
+
+def reward_compute_penalty(*, completions=None, latent_stats=None, lam_visible=1e-4, lam_latent=2e-4, **kwargs):
+    # -lam_visible * n_visible - lam_latent * n_latent
+    stats = latent_stats or [{"n_visible": 0, "n_latent": 0} for _ in completions]
+    scores = []
+    for st in stats:
+        r = -lam_visible * float(st.get("n_visible", 0)) - lam_latent * float(st.get("n_latent", 0))
+        scores.append(r)
+    return scores
 
 # ---------------------------- CLI / main ---------------------------- #
-
-
 @dataclass
 class Args:
     model_id: str
     output_dir: str
     per_device_train_batch_size: int
+    gradient_accumulation_steps: int
     learning_rate: float
     num_train_epochs: int
     num_generations: int
@@ -310,9 +347,10 @@ def parse_args() -> Args:
     p.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     p.add_argument("--output_dir", type=str, default="output")
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
     p.add_argument("--learning_rate", type=float, default=2e-6)
     p.add_argument("--num_train_epochs", type=int, default=1)
-    p.add_argument("--num_generations", type=int, default=4)
+    p.add_argument("--num_generations", type=int, default=16)
     p.add_argument("--latent_max_per_block", type=int, default=8)
     p.add_argument("--max_visible_tokens", type=int, default=256)
     p.add_argument("--kl_beta", type=float, default=0.02)
@@ -366,13 +404,14 @@ def main():
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_train_epochs,
         num_generations=args.num_generations,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         epsilon=args.clip_eps,
         epsilon_high=0.28,
         beta=args.kl_beta,             # KL to ref (optional in TRL; 0.0 by default per docs)
         scale_rewards=None,
         loss_type="dr_grpo",
         mask_truncated_completions=True,
-        importance_sampling_level=["token" if args.algo == "grpo" else "sequence"],
+        importance_sampling_level="token" if args.algo == "grpo" else "sequence",
     )
 
     trainer = LatentReasoningTrainer(
@@ -385,6 +424,11 @@ def main():
         lam_latent=2e-4,
         # NOTE: We’re using GRPO’s internal ref/kl if beta>0 (per TRL docs).
         # If you want an explicit ref model snapshot, set cfg.sync_ref_model=True and related knobs.
+        reward_funcs=[
+            reward_format,
+            reward_accuracy,
+            reward_compute_penalty,
+        ]
     )
 
     # Train (use whichever entrypoint your TRL exposes)
