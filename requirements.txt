@@ -1,0 +1,10 @@
+torch
+trl
+datasets
+transformers
+accelerate
+peft
+bitsandbytes
+wandb
+protobuf
+vllm
