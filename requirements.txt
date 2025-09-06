@@ -8,3 +8,5 @@ bitsandbytes
 wandb
 protobuf
 vllm
+packaging
+ninja

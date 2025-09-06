@@ -8,7 +8,7 @@ Key ideas:
 - We trigger evaluation from a TrainerCallback.on_save hook so each save gets an AIME Avg@64 score.
 
 Usage:
-  python train_sft.py \
+  accelerate launch train_sft.py \
     --dataset_name shockroborty/acereason_v7_math_multiresponse \
     --base_model Qwen/Qwen2.5-3B-Instruct \
     --out_dir sft_output \
@@ -50,7 +50,6 @@ def parse_args():
     ap.add_argument("--per_device_bs", type=int, default=1)
     ap.add_argument("--grad_accum", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--max_len", type=int, default=4096)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
     ap.add_argument("--points_per_epoch", type=int, default=8, help="How many mid-epoch eval points.")
@@ -71,19 +70,22 @@ def build_chat(tokenizer, user_text: str, assistant_text: str, max_len: int):
     messages.append({"role":"assistant","content": assistant_text})
 
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    toks = tokenizer(text, truncation=True, max_length=max_len)
+    # toks = tokenizer(text, truncation=True, max_length=max_len)
+    toks = tokenizer(text, truncation=True)
     input_ids = toks["input_ids"]
 
-    # mask user side for loss
+    # Prefix up to the start of assistant (includes assistant preamble for clean boundary)
     messages_u = []
     if SYSTEM_HINT:
         messages_u.append({"role":"system","content": SYSTEM_HINT})
     messages_u.append({"role":"user","content": user_text})
-    user_only = tokenizer.apply_chat_template(messages_u, tokenize=False, add_generation_prompt=False)
-    user_prefix = tokenizer(user_only, truncation=True, max_length=max_len)["input_ids"]
+    user_only = tokenizer.apply_chat_template(messages_u, tokenize=False, add_generation_prompt=True)
+    # user_prefix = tokenizer(user_only, truncation=True, max_length=max_len)["input_ids"]
+    user_prefix = tokenizer(user_only, truncation=True)["input_ids"]
 
     labels = [-100] * len(input_ids)
     labels[len(user_prefix):] = input_ids[len(user_prefix):]
+
     return {"input_ids": input_ids, "attention_mask": toks["attention_mask"], "labels": labels}
 
 # ----------- Eval-on-save callback -----------
@@ -132,7 +134,7 @@ class PerfMonitor(TrainerCallback):
     """Tracks throughput and approximates MFU (Nanogpt-style: flops/token≈6*n_params).
 
     Notes:
-    - Uses args.max_len (or --seq_len_for_mfu) as seq length proxy.
+    - Uses max_len (or --seq_len_for_mfu) as seq length proxy.
     - Tokens/sec computed from optimizer steps and gradient accumulation.
     - MFU is per-GPU TFLOPS / peak (default peak for H100 BF16 ~989 TFLOPS).
     """
@@ -230,10 +232,11 @@ if __name__ == "__main__":
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
+    max_len = tok.model_max_length
     def _map(ex):
-        return build_chat(tok, ex["input"], ex["output"], max_len=args.max_len)
+        return build_chat(tok, ex["input"], ex["output"], max_len=max_len)
 
-    dataset = ds_in.map(_map, remove_columns=ds_in.column_names, desc="Tokenizing")
+    dataset = ds_in.map(_map, remove_columns=ds_in.column_names, desc="Tokenizing", num_proc=os.cpu_count(), cache_dir=CACHE_DIR)
 
     # Model (full or LoRA)
     model = AutoModelForCausalLM.from_pretrained(
@@ -241,6 +244,7 @@ if __name__ == "__main__":
         torch_dtype=torch.bfloat16 if args.bf16 else None,
         attn_implementation="flash_attention_2",
         trust_remote_code=True,
+        cache_dir=CACHE_DIR,
         # Important: let Trainer/Accelerate handle device placement & DDP. Avoid device_map="auto" for training.
     )
     # Only compile on single GPU to avoid incompatibilities with DDP/FSDP and device sharding
@@ -299,12 +303,12 @@ if __name__ == "__main__":
         gradient_checkpointing=True,
         optim=chosen_optim,
         max_grad_norm=1.0,
-        dataloader_num_workers=8,
+        dataloader_num_workers=os.cpu_count(),
         ddp_find_unused_parameters=False,
     )
 
     # Perf monitor (tokens/s, TFLOPS, MFU)
-    seq_len_for_mfu = args.seq_len_for_mfu or args.max_len
+    seq_len_for_mfu = args.seq_len_for_mfu or max_len
     perf_cb = PerfMonitor(
         per_device_bs=args.per_device_bs,
         grad_accum=args.grad_accum,

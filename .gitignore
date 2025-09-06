@@ -3,3 +3,4 @@ cache/
 venv/
 .vscode/
 sft_output/checkpoints/*
+wandb/
