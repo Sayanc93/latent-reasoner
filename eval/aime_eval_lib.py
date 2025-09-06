@@ -22,24 +22,42 @@ import re
 import json
 import csv
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, cast
 from datasets import load_dataset
 from tqdm import tqdm
-from typing import List, Optional
 try:
     # When executed as a package: python -m eval.aime_eval_lib
     from .grader import math_equal
 except Exception:
     # When executed as a standalone script: python eval/aime_eval_lib.py
-    import sys, os
+    import sys
+    import os
     sys.path.append(os.path.dirname(__file__))
     from grader import math_equal
 
-# Prompting for instruct models
-SYSTEM_PROMPT = (
-    "You are a helpful math assistant. You should think step-by-step. "
-    "Respond with only the final numeric answer in \\boxed{NNN}."
-)
+# Prompting helpers
+QWEN_SYSTEM_PROMPT = "You are a helpful and harmless assistant. You should think step-by-step."
+
+def build_prompt(question: str, model_type: str) -> str:
+    question = str(question).strip()
+    if model_type == "qwen":
+        return (
+            f"<|im_start|>system\n{QWEN_SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n{question}\n\nPlease place your final answer inside \\boxed{{}}.<|im_end|>\n"
+            f"<|im_start|>assistant\n<think>\n"
+        )
+    return (
+        f"<｜begin▁of▁sentence｜><｜User｜>{question}\n"
+        f"Please reason step by step, and put your final answer within \\boxed{{}}.<｜Assistant｜><think>\n"
+    )
+
+def _trim_special_end_tokens(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    for marker in ("<|im_end|>", "<|end_of_text|>", "<|eot_id|>"):
+        if marker in text:
+            text = text.split(marker, 1)[0]
+    return text
 
 # ---------- AIME answer parsing ----------
 BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
@@ -48,35 +66,14 @@ THREE_DIGIT_RE = re.compile(r"\b(\d{1,3})\b")
 
 CACHE_DIR = f"{os.getcwd()}/cache"
 
-def _norm_aime(x: str) -> Optional[str]:
-    if x is None: return None
-    s = str(x)
-    m = BOXED_RE.search(s)
-    if m:
-        cand = m.group(1)
-    else:
-        ints = LAST_INT_RE.findall(s)
-        cand = ints[-1] if ints else (THREE_DIGIT_RE.search(s).group(1) if THREE_DIGIT_RE.search(s) else None)
-    if cand is None: return None
-    try:
-        v = int(cand)
-        return f"{v:03d}" if 0 <= v <= 999 else None
-    except ValueError:
-        return None
-
-def _match(pred: str, gold: str) -> bool:
-    p = _norm_aime(pred); g = _norm_aime(gold)
-    return p is not None and g is not None and p == g
-
 # ---------- Model loading (full or LoRA) ----------
 
-def _load_vllm_generator(model_path: str, base_model: Optional[str]):
+def _load_vllm_generator(model_path: str, base_model: Optional[str], model_type: str, max_new_tokens: int):
     """
     Returns generate_batch(prompts: List[str], seed: int) -> List[str]
     Detects if model_path is a LoRA adapter (presence of adapter_config.json) and uses vLLM.
     """
     import os
-    from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
     is_lora = os.path.exists(os.path.join(model_path, "adapter_config.json"))
@@ -85,27 +82,17 @@ def _load_vllm_generator(model_path: str, base_model: Optional[str]):
         raise ValueError("LoRA adapter detected; please pass --base_model (e.g., Qwen/Qwen2.5-Math-7B).")
 
     tok_model_path = base_model if is_lora else model_path
-    tok = AutoTokenizer.from_pretrained(tok_model_path, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    tok.padding_side = "left"
 
     if is_lora:
-        llm = LLM(model=base_model, tokenizer=tok, dtype=base_model.dtype, enable_lora=True)
-        try:
-            llm.load_lora_adapter("adapter", model_path)
-        except AttributeError:
-            try:
-                llm.add_lora_adapter("adapter", model_path)
-            except Exception as e:
-                raise RuntimeError(f"Unable to load LoRA adapter with vLLM: {e}")
+        assert base_model is not None
+        llm = LLM(model=base_model, tokenizer=tok_model_path)
         try:
             from vllm.lora.request import LoRARequest
-            lora_request = LoRARequest("adapter", adapter_id=1)
+            lora_request = LoRARequest("adapter", lora_int_id=1)
         except Exception as e:
             raise RuntimeError(f"vLLM LoRARequest import failed. Please update vLLM. Error: {e}")
     else:
-        llm = LLM(model=model_path, tokenizer=tok, dtype=base_model.dtype, seed=seed)
+        llm = LLM(model=model_path, tokenizer=tok_model_path, cache_dir=CACHE_DIR)
         lora_request = None
 
     def generate_batch(
@@ -113,17 +100,10 @@ def _load_vllm_generator(model_path: str, base_model: Optional[str]):
         seed: int,
         temperature: float = 0.6,
         top_p: float = 0.95,
-        max_new_tokens: int = 1024,
         gen_bs: int = 8,
     ) -> List[str]:
-        # Build chat-formatted prompts
-        texts: List[str] = []
-        for p in prompts:
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"{p}\n\nReturn only the final answer as \\boxed{{NNN}}."},
-            ]
-            texts.append(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+        # Build AceReason-style prompts
+        texts: List[str] = [build_prompt(p, model_type=model_type) for p in prompts]
 
         sampling_params = SamplingParams(
             temperature=temperature,
@@ -142,7 +122,7 @@ def _load_vllm_generator(model_path: str, base_model: Optional[str]):
             else:
                 results = llm.generate(chunk, sampling_params)
             for r in results:
-                outputs.append(r.outputs[0].text)
+                outputs.append(_trim_special_end_tokens(r.outputs[0].text))
 
         return outputs
 
@@ -218,13 +198,24 @@ def check_after_fraction_mapping(extracted_answer: str, gold: str) -> bool:
 
 
 # ---------- AIME24 Avg@N ----------
-def run_aime24_avgN(model_path: str, out_dir: str, n_seeds: List[int] = [121, 131, 141, 151, 161, 171, 181, 191], base_model: Optional[str] = None) -> float:
+def run_aime24_avgN(
+    model_path: str, 
+    out_dir: str, 
+    n_seeds: List[int] = [121, 131, 141, 151, 161, 171, 181, 191], 
+    base_model: Optional[str] = None,
+    dataset_name: Optional[str] = "HuggingFaceH4/aime_2024",
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    gen_bs: int = 8,
+    model_type: str = "qwen",
+    max_new_tokens: int = 32768,
+) -> float:
     os.makedirs(out_dir, exist_ok=True)
-    ds = load_dataset("HuggingFaceH4/aime_2024", split="train", cache_dir=CACHE_DIR)
+    ds = load_dataset(dataset_name, split="train", cache_dir=CACHE_DIR)
     problems = [r["problem"] for r in ds]
     answers  = [f'{int(r["answer"]):03d}' for r in ds]
 
-    gen = _load_vllm_generator(model_path, base_model)
+    gen = _load_vllm_generator(model_path, base_model, model_type=model_type, max_new_tokens=max_new_tokens)
 
     # reference-style patterns
     pattern1_re = re.compile(r"\\boxed\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}", re.DOTALL)
@@ -236,7 +227,13 @@ def run_aime24_avgN(model_path: str, out_dir: str, n_seeds: List[int] = [121, 13
     per_seed_acc: List[float] = []
     per_seed_matrix: List[List[int]] = []
     for seed in tqdm(n_seeds, desc="seeds"):
-        preds = gen(problems, seed=seed, temperature=0.6, top_p=0.95, max_new_tokens=1024, gen_bs=8)
+        preds = gen(
+            problems,
+            seed=seed,
+            temperature=temperature,
+            top_p=top_p,
+            gen_bs=gen_bs
+        )
         correct_vec: List[int] = []
         for p, g in zip(preds, answers):
             m1 = pattern1_re.findall(p)
@@ -284,7 +281,7 @@ def run_aime24_avgN(model_path: str, out_dir: str, n_seeds: List[int] = [121, 13
     with open(os.path.join(out_dir, "aime24_summary.json"), "w") as f:
         json.dump({"avg_at_n": avgN, "n": len(n_seeds), "per_seed": per_seed_acc}, f, indent=2)
     with open(os.path.join(out_dir, "aime24_correct_matrix.csv"), "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["problem_idx"] + [f"seed_{i}" for i in range(n_seeds)])
+        w = csv.writer(f); w.writerow(["problem_idx"] + [f"seed_{seed}" for seed in n_seeds])
         for i in range(len(problems)):
             w.writerow([i] + [per_seed_matrix[s][i] for s in range(len(n_seeds))])
 
@@ -297,7 +294,24 @@ if __name__ == "__main__":
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--seeds", type=str, default="121 131 141 151 161 171 181 191")
     ap.add_argument("--base_model", default=None, help="Required if model_path is a LoRA adapter dir.")
+    ap.add_argument("--dataset_name", default="HuggingFaceH4/aime_2024")
+    ap.add_argument("--temperature", type=float, default=0.6)
+    ap.add_argument("--top_p", type=float, default=0.95)
+    ap.add_argument("--gen_bs", type=int, default=8)
+    ap.add_argument("--model_type", type=str, default="qwen", choices=["qwen", "r1"])
+    ap.add_argument("--max_new_tokens", type=int, default=32768)
     args = ap.parse_args()
 
     n_seeds = [int(seed) for seed in args.seeds.split(" ")]
-    run_aime24_avgN(args.model_path, args.out_dir, n_seeds=n_seeds, base_model=args.base_model)
+    run_aime24_avgN(
+        args.model_path,
+        args.out_dir,
+        n_seeds=n_seeds,
+        base_model=args.base_model,
+        dataset_name=args.dataset_name,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        gen_bs=args.gen_bs,
+        model_type=args.model_type,
+        max_new_tokens=args.max_new_tokens,
+    )

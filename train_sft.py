@@ -28,15 +28,14 @@ Outputs:
 import argparse
 import os
 import math
-import json
 import csv
-import numpy as np
 from datasets import load_dataset, DatasetDict
 from transformers import (AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments,
                           default_data_collator, TrainerCallback)
 from peft import LoraConfig, get_peft_model
 import torch
 import time
+from typing import List
 
 CACHE_DIR = f"{os.getcwd()}/cache"
 
@@ -118,7 +117,7 @@ class EvalOnSave(TrainerCallback):
         super().__init__()
         self.run_dir = run_dir
         self.base_model = base_model
-        self.seeds = n_seeds
+        self.seeds = seeds
         self.steps_per_epoch = max(1, steps_per_epoch)
         self.csv_path = os.path.join(run_dir, "aime24_points.csv")
         # init CSV header
@@ -140,12 +139,16 @@ class EvalOnSave(TrainerCallback):
         from eval.aime_eval_lib import run_aime24_avgN
 
         # If this is LoRA, last_ckpt contains adapters; pass base_model
-        avgN = run_aime24_avgN(last_ckpt, eval_out, seeds=self.n_seeds, base_model=self.base_model)
+        avgN = run_aime24_avgN(
+            last_ckpt,
+            eval_out,
+            seeds=self.seeds,
+            base_model=self.base_model)
 
         frac_epoch = state.global_step / self.steps_per_epoch
         with open(self.csv_path, "a", newline="") as f:
             csv.writer(f).writerow([state.global_step, f"{frac_epoch:.3f}", f"{avgN:.2f}"])
-        print(f"[FIG6] step={state.global_step}  epoch~{frac_epoch:.3f}  AIME24 Avg@{self.n_seeds}={avgN:.2f}%")
+        print(f"step={state.global_step}  epoch~{frac_epoch:.3f}  AIME24 Avg@{len(self.seeds)}={avgN:.2f}%")
 
 
 class PerfMonitor(TrainerCallback):
