@@ -97,10 +97,14 @@ def _load_hf_generator(model_path: str, base_model: Optional[str]):
         batch = tok(prompts, return_tensors="pt", padding=True).to(model.device)
         out = model.generate(
             **batch,
-            do_sample=True, temperature=temperature, top_p=top_p,
+            do_sample=True, 
+            temperature=temperature, 
+            top_p=top_p,
             max_new_tokens=max_new_tokens,
-            eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id,
-            generator=g, use_cache=True
+            eos_token_id=tok.eos_token_id, 
+            pad_token_id=tok.pad_token_id,
+            generator=g, 
+            use_cache=True
         )
         gens = []
         prompt_len = batch["input_ids"].shape[1]

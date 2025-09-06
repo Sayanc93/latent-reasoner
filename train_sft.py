@@ -88,6 +88,24 @@ def build_chat(tokenizer, user_text: str, assistant_text: str, max_len: int):
 
     return {"input_ids": input_ids, "attention_mask": toks["attention_mask"], "labels": labels}
 
+def make_collate_build_chat(tokenizer, max_len: int):
+    def collate_fn(batch):
+        feats = [build_chat(tokenizer, ex["input"], ex["output"], max_len=max_len) for ex in batch]
+        base = [{"input_ids": f["input_ids"], "attention_mask": f["attention_mask"]} for f in feats]
+        padded = tokenizer.pad(base, padding=True, return_tensors="pt")
+        max_L = padded["input_ids"].shape[1]
+        lab_batch = []
+        for f in feats:
+            lab = f["labels"]
+            if len(lab) < max_L:
+                lab = lab + [-100] * (max_L - len(lab))
+            else:
+                lab = lab[:max_L]
+            lab_batch.append(lab)
+        padded["labels"] = torch.tensor(lab_batch, dtype=torch.long)
+        return padded
+    return collate_fn
+
 # ----------- Eval-on-save callback -----------
 class EvalOnSave(TrainerCallback):
     """
@@ -187,12 +205,15 @@ class PerfMonitor(TrainerCallback):
         tokens = max(0, self._win_tokens)
         toks_per_s = tokens / dt if dt > 0 else 0.0
 
-        # Nanogpt-style flops per token ≈ 6 * n_params
-        flops_per_token = 6.0 * self._n_params if self._n_params else None
-        tflops_total = (toks_per_s * flops_per_token / 1e12) if flops_per_token else 0.0
-        # per GPU TFLOPS and MFU
-        tflops_per_gpu = tflops_total / self.world_size if self.world_size > 0 else 0.0
-        mfu = (tflops_per_gpu / self.gpu_peak_tflops) if self.gpu_peak_tflops > 0 else 0.0
+        # FLOPs per token (NanoGPT heuristic): ~6 × number of parameters
+        has_params = self._n_params is not None
+        flops_per_token = (6.0 * self._n_params) if has_params else 0.0
+
+        # Cluster TFLOPS, then per-GPU and MFU
+        tflops_total = (toks_per_s * flops_per_token) / 1e12
+        tflops_per_gpu = tflops_total / self.world_size  # world_size is clamped ≥ 1
+        mfu = tflops_per_gpu / self.gpu_peak_tflops if self.gpu_peak_tflops > 0 else 0.0
+
 
         if logs is not None:
             logs["tokens_per_sec"] = round(toks_per_s, 2)
@@ -225,18 +246,18 @@ if __name__ == "__main__":
     ds_raw = load_dataset(args.dataset_name, cache_dir=CACHE_DIR)  # columns: input, output, prompt_hash, resp_len
     # Pick the train split if a DatasetDict is returned
     if isinstance(ds_raw, DatasetDict):
-        ds_in = ds_raw["train"]
+        dataset = ds_raw["train"]
     else:
-        ds_in = ds_raw
+        dataset = ds_raw
     tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
     max_len = tok.model_max_length
-    def _map(ex):
-        return build_chat(tok, ex["input"], ex["output"], max_len=max_len)
+    # def _map(ex):
+    #     return build_chat(tok, ex["input"], ex["output"], max_len=max_len)
 
-    dataset = ds_in.map(_map, remove_columns=ds_in.column_names, desc="Tokenizing", num_proc=os.cpu_count(), cache_dir=CACHE_DIR)
+    # dataset = dataset.map(_map, remove_columns=dataset.column_names, desc="Tokenizing", num_proc=os.cpu_count(), cache_dir=CACHE_DIR)
 
     # Model (full or LoRA)
     model = AutoModelForCausalLM.from_pretrained(
@@ -322,7 +343,7 @@ if __name__ == "__main__":
         args=training_args,
         train_dataset=dataset,
         tokenizer=tok,
-        data_collator=default_data_collator,
+        data_collator=make_collate_build_chat(tok, max_len),
         callbacks=[
             perf_cb,
             EvalOnSave(run_dir=args.out_dir,
