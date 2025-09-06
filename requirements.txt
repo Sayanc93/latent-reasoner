@@ -10,3 +10,9 @@ protobuf
 vllm
 packaging
 ninja
+setuptools
+bitsandbytes
+deepspeed
+sympy
+antlr4-python3-runtime
+tqdm

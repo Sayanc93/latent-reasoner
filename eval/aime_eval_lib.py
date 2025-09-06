@@ -26,11 +26,20 @@ from typing import List, Optional
 from datasets import load_dataset
 from tqdm import tqdm
 from typing import List, Optional
+from .grader import math_equal
+
+# Prompting for instruct models
+SYSTEM_PROMPT = (
+    "You are a helpful math assistant. You should think step-by-step. "
+    "Respond with only the final numeric answer in \\boxed{NNN}."
+)
 
 # ---------- AIME answer parsing ----------
 BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
 LAST_INT_RE = re.compile(r"(-?\d+)")
 THREE_DIGIT_RE = re.compile(r"\b(\d{1,3})\b")
+
+CACHE_DIR = f"{os.getcwd()}/cache"
 
 def _norm_aime(x: str) -> Optional[str]:
     if x is None: return None
@@ -67,15 +76,16 @@ def _load_hf_generator(model_path: str, base_model: Optional[str]):
         raise ValueError("LoRA adapter detected; please pass --base_model (e.g., Qwen/Qwen2.5-Math-7B).")
 
     tok_model_path = base_model if is_lora else model_path
-    tok = AutoTokenizer.from_pretrained(tok_model_path, use_fast=True, trust_remote_code=True)
-    if tok.pad_token_id is None:
+    tok = AutoTokenizer.from_pretrained(tok_model_path, trust_remote_code=True)
+    if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
 
     if is_lora:
         from peft import PeftModel, PeftConfig
         base = AutoModelForCausalLM.from_pretrained(
             base_model, 
-            torch_dtype=torch.bfloat16, 
+            dtype=torch.bfloat16, 
             attn_implementation="flash_attention_2",
             trust_remote_code=True, 
             device_map="auto"
@@ -86,51 +96,189 @@ def _load_hf_generator(model_path: str, base_model: Optional[str]):
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_path, 
-            torch_dtype=torch.bfloat16, 
+            dtype=torch.bfloat16, 
             attn_implementation="flash_attention_2",
             trust_remote_code=True,
             device_map="auto"
         )
+    model.eval()
 
-    def generate_batch(prompts: List[str], seed: int, temperature=0.6, top_p=0.95, max_new_tokens=32768):
-        g = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(seed)
-        batch = tok(prompts, return_tensors="pt", padding=True).to(model.device)
-        out = model.generate(
-            **batch,
-            do_sample=True, 
-            temperature=temperature, 
-            top_p=top_p,
-            max_new_tokens=max_new_tokens,
-            eos_token_id=tok.eos_token_id, 
-            pad_token_id=tok.pad_token_id,
-            generator=g, 
-            use_cache=True
-        )
-        gens = []
-        prompt_len = batch["input_ids"].shape[1]
-        for i in range(out.shape[0]):
-            gen_ids = out[i, prompt_len:]
-            gens.append(tok.decode(gen_ids, skip_special_tokens=True))
-        return gens
+    def generate_batch(
+        prompts: List[str],
+        seed: int,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        max_new_tokens: int = 1024,
+        gen_bs: int = 8,
+    ) -> List[str]:
+        import torch
+
+        # Build chat-formatted prompts
+        texts: List[str] = []
+        for p in prompts:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"{p}\n\nReturn only the final answer as \\boxed{{NNN}}."},
+            ]
+            texts.append(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+
+        outputs: List[str] = []
+
+        for i in tqdm(range(0, len(texts), gen_bs), desc="prompts", leave=False):
+            chunk = texts[i : i + gen_bs]
+            batch = tok(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
+            with torch.inference_mode():
+                out = model.generate(
+                    **batch,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=tok.eos_token_id,
+                    pad_token_id=tok.pad_token_id,
+                    use_cache=True
+                )
+
+            lens = batch["attention_mask"].sum(dim=1).tolist()
+            for j in range(out.shape[0]):
+                start = lens[j]
+                gen_ids = out[j, start:]
+                outputs.append(tok.decode(gen_ids, skip_special_tokens=True))
+
+        return outputs
 
     return generate_batch
+
+# ---------- Reference-style extraction and matching helpers ----------
+def is_completely_wrapped_by_text(input_string: str) -> Optional[str]:
+    pattern = r'^\\text{(.*)}$'
+    match = re.match(pattern, input_string)
+    if match:
+        extracted_content = match.group(1)
+        extracted_content = extracted_content.replace("(", "").replace(")", "").replace(",", "")
+        return extracted_content
+    return None
+
+
+def math_answer_cleaning(answer: str) -> str:
+    extracted_content = is_completely_wrapped_by_text(answer)
+    answer = extracted_content if extracted_content else answer
+
+    answer = answer.replace(",\\!", "").replace("{,}", "").replace("\\$", "")
+    answer = answer.replace("dfrac{", "frac{").replace("tfrac{", "frac{")
+    answer = answer.replace("^\\circ", "").replace("^{\\circ}", "")
+    answer = answer.replace("\\quad", "")
+    answer = re.sub(r'\\,\\text\{.*?\}', '', answer)
+    answer = re.sub(r'\\text\{.*?\}', '', answer)
+    answer = re.sub(r'(\s\^\{-\d+\})', '', answer)
+    answer = answer.replace(" ", "")
+    answer = answer.replace("\n", "").replace("\\n", "")
+    answer = re.sub(r'([+-]?\d*\.?\d+)[\\]times10\^\{([+-]?\d+)\}', r'\1e\2', answer)
+    answer = re.sub(r'([+-]?\d*\.?\d+)[\\]times10\^([+-]?\d+)', r'\1e\2', answer)
+    answer = re.sub(r'(\d+)\^\{(\d+)\}', r'\1^\2', answer)
+    answer = re.sub(r"10\^\{(-?\d+)\}", r"1e\1", answer)
+    answer = answer.replace(",", "").lower()
+    if answer.endswith("\\"):
+        answer = answer[:-1]
+    func_pattern = r'^[a-zA-Z_]\w*\([a-zA-Z_]\w*\)$'
+    if "=" in answer and (re.match(func_pattern, answer.split("=")[0]) or len(answer.split("=")[0]) <= 3):
+        answer = answer.split("=", 1)[1]
+    return answer
+
+
+def round_number(answer: str) -> str:
+    def _is_float(string: str) -> bool:
+        try:
+            float(string)
+            return True
+        except Exception:
+            return False
+
+    if _is_float(answer) and float(answer) < 1:
+        return f"{float(answer):.2g}"
+    return answer
+
+
+def calculate_numbers(input_string: str):
+    try:
+        return eval(input_string)
+    except Exception:
+        return None
+
+
+def is_equal_after_calculation(extracted_answer: str, gold: str) -> bool:
+    gold = re.sub(r'\\frac{(.*?)}{(.*?)}', r'(\1/\2)', gold)
+    extracted_answer = re.sub(r'\\frac{(.*?)}{(.*?)}', r'(\1/\2)', extracted_answer)
+    gold_result = calculate_numbers(gold)
+    extracted_result = calculate_numbers(extracted_answer)
+    return (gold_result is not None) and (extracted_result is not None) and (gold_result == extracted_result)
+
+
+def check_after_fraction_mapping(extracted_answer: str, gold: str) -> bool:
+    return re.sub(r'\\frac{(.*?)}{(.*?)}', r'\1/\2', extracted_answer) == re.sub(r'\\frac{(.*?)}{(.*?)}', r'\1/\2', gold)
+
 
 # ---------- AIME24 Avg@N ----------
 def run_aime24_avgN(model_path: str, out_dir: str, n_seeds: int = 64, base_model: Optional[str] = None) -> float:
     os.makedirs(out_dir, exist_ok=True)
-    ds = load_dataset("HuggingFaceH4/aime_2024")["train"]  # 30 problems, fields include "problem", "answer"
+    ds = load_dataset("HuggingFaceH4/aime_2024", split="train", cache_dir=CACHE_DIR)
     problems = [r["problem"] for r in ds]
     answers  = [f'{int(r["answer"]):03d}' for r in ds]
 
     gen = _load_hf_generator(model_path, base_model)
 
-    per_seed_acc = []
-    per_seed_matrix = []
-    for seed in range(n_seeds):
-        preds = gen(problems, seed=seed, temperature=0.6, top_p=0.95, max_new_tokens=32768)
-        correct = [1 if _match(p, g) else 0 for p, g in zip(preds, answers)]
-        per_seed_matrix.append(correct)
-        per_seed_acc.append(100.0 * sum(correct) / len(correct))
+    # reference-style patterns
+    pattern1_re = re.compile(r"\\boxed\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}", re.DOTALL)
+    pattern2_re = re.compile(r"\*\*(.*?)\*\*", re.DOTALL)
+    pattern3_re = re.compile(r"\\\[\n(.*?)\n\\\]", re.DOTALL)
+    pattern4_re = re.compile(r'is \\\((.*?)\\\)')
+    pattern5_re = re.compile(r"\\\[\\n(.*?)\\n\\\]", re.DOTALL)
+
+    per_seed_acc: List[float] = []
+    per_seed_matrix: List[List[int]] = []
+    for seed in tqdm(range(n_seeds), desc="seeds"):
+        preds = gen(problems, seed=seed, temperature=0.6, top_p=0.95, max_new_tokens=1024, gen_bs=8)
+        correct_vec: List[int] = []
+        for p, g in zip(preds, answers):
+            m1 = pattern1_re.findall(p)
+            m2 = pattern2_re.findall(p)
+            m3 = pattern3_re.findall(p)
+            m4 = pattern4_re.findall(p)
+            m5 = pattern5_re.findall(p)
+            if len(m1) >= 1:
+                extracted = m1[-1]
+            elif len(m2) >= 1:
+                extracted = m2[-1]
+            elif len(m3) >= 1:
+                extracted = m3[-1]
+            elif len(m4) >= 1:
+                extracted = m4[-1]
+            elif len(m5) >= 1:
+                extracted = m5[-1]
+            else:
+                extracted = None
+
+            if extracted is None:
+                correct_vec.append(0)
+                continue
+
+            pred_clean = math_answer_cleaning(str(extracted))
+            gold_clean = math_answer_cleaning(str(g))
+
+            is_correct = False
+            if math_equal(pred_clean, gold_clean):
+                is_correct = True
+            elif round_number(pred_clean) == round_number(gold_clean):
+                is_correct = True
+            elif is_equal_after_calculation(pred_clean, gold_clean):
+                is_correct = True
+            elif check_after_fraction_mapping(pred_clean, gold_clean):
+                is_correct = True
+
+            correct_vec.append(1 if is_correct else 0)
+
+        per_seed_matrix.append(correct_vec)
+        per_seed_acc.append(100.0 * sum(correct_vec) / len(correct_vec))
 
     avgN = float(np.mean(per_seed_acc))
     # Persist results

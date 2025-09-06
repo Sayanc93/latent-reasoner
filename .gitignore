@@ -1,6 +1,11 @@
 cache/
+.cache/
 .mypy_cache/
 venv/
+.venv/
 .vscode/
 sft_output/checkpoints/*
 wandb/
+eval/__pycache__/
+__pycache__/
+eval/latex2sympy/__pycache__/

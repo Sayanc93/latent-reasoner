@@ -4,7 +4,7 @@ SFT on your v7-math (multi-response) subset with *in-between-epoch* AIME24 evals
 
 Key ideas:
 - We pick a target number of "points per epoch" (e.g., 8). If your epoch has 2,400 optimizer steps,
-  then we save/eval every 2,400/8 = 300 steps → 8 dots per epoch on the Fig.6-like curve.
+  then we save/eval every 2,400/8 = 300 steps → 8 dots per epoch.
 - We trigger evaluation from a TrainerCallback.on_save hook so each save gets an AIME Avg@64 score.
 
 Usage:
@@ -17,7 +17,7 @@ Usage:
     --grad_accum 16 \
     --points_per_epoch 8 \
     --bf16 \
-    --lora_r 64
+    --lora_r 0
 
 Outputs:
   - Checkpoints: out_dir/checkpoints/checkpoint-STEP
@@ -140,7 +140,7 @@ class EvalOnSave(TrainerCallback):
         from eval.aime_eval_lib import run_aime24_avgN
 
         # If this is LoRA, last_ckpt contains adapters; pass base_model
-        avgN = run_aime24_avgN(last_ckpt, eval_out, n_seeds=self.n_seeds, base_model=self.base_model)
+        avgN = run_aime24_avgN(last_ckpt, eval_out, n_seeds=1, base_model=self.base_model)
 
         frac_epoch = state.global_step / self.steps_per_epoch
         with open(self.csv_path, "a", newline="") as f:
@@ -249,11 +249,9 @@ if __name__ == "__main__":
         dataset = ds_raw["train"]
     else:
         dataset = ds_raw
-    tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
+    tok = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
-    max_len = tok.model_max_length
+    max_len = tok.model_max_length * 4 # for yarn rope scaling
     # def _map(ex):
     #     return build_chat(tok, ex["input"], ex["output"], max_len=max_len)
 
@@ -262,11 +260,11 @@ if __name__ == "__main__":
     # Model (full or LoRA)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        torch_dtype=torch.bfloat16 if args.bf16 else None,
         attn_implementation="flash_attention_2",
         trust_remote_code=True,
+        dtype=torch.bfloat16 if args.bf16 else torch.float16,
         cache_dir=CACHE_DIR,
-        # Important: let Trainer/Accelerate handle device placement & DDP. Avoid device_map="auto" for training.
+        low_cpu_mem_usage=True,
     )
     # Only compile on single GPU to avoid incompatibilities with DDP/FSDP and device sharding
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -314,18 +312,20 @@ if __name__ == "__main__":
         per_device_train_batch_size=args.per_device_bs,
         gradient_accumulation_steps=args.grad_accum,
         bf16=args.bf16,
+        fp16=False,
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         logging_steps=min(50, save_steps),
         save_strategy="steps",
-        save_steps=save_steps,
+        save_steps=2,
         save_total_limit=1000,  # keep many mid-epoch ckpts; prune later if needed
-        report_to="wandb",
+        report_to=[],
         gradient_checkpointing=True,
         optim=chosen_optim,
         max_grad_norm=1.0,
         dataloader_num_workers=os.cpu_count(),
         ddp_find_unused_parameters=False,
+        remove_unused_columns=False,
     )
 
     # Perf monitor (tokens/s, TFLOPS, MFU)
@@ -342,7 +342,7 @@ if __name__ == "__main__":
         model=model,
         args=training_args,
         train_dataset=dataset,
-        tokenizer=tok,
+        processing_class=tok,
         data_collator=make_collate_build_chat(tok, max_len),
         callbacks=[
             perf_cb,
