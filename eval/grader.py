@@ -16,7 +16,14 @@ from collections import defaultdict
 from sympy import simplify, N
 from sympy.parsing.sympy_parser import parse_expr
 from sympy.parsing.latex import parse_latex
-from .latex2sympy.latex2sympy2 import latex2sympy
+try:
+    # When executed as a package: python -m eval.aime_eval_lib
+    from .latex2sympy.latex2sympy2 import latex2sympy
+except Exception:
+    # When executed as a standalone script: python eval/aime_eval_lib.py
+    import sys, os
+    sys.path.append(os.path.dirname(__file__))
+    from latex2sympy.latex2sympy2 import latex2sympy
 
 # from .parser import choice_answer_clean, strip_string
 # from parser import choice_answer_clean

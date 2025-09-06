@@ -26,7 +26,14 @@ from typing import List, Optional
 from datasets import load_dataset
 from tqdm import tqdm
 from typing import List, Optional
-from .grader import math_equal
+try:
+    # When executed as a package: python -m eval.aime_eval_lib
+    from .grader import math_equal
+except Exception:
+    # When executed as a standalone script: python eval/aime_eval_lib.py
+    import sys, os
+    sys.path.append(os.path.dirname(__file__))
+    from grader import math_equal
 
 # Prompting for instruct models
 SYSTEM_PROMPT = (
@@ -62,14 +69,16 @@ def _match(pred: str, gold: str) -> bool:
     return p is not None and g is not None and p == g
 
 # ---------- Model loading (full or LoRA) ----------
-def _load_hf_generator(model_path: str, base_model: Optional[str]):
+
+def _load_vllm_generator(model_path: str, base_model: Optional[str]):
     """
     Returns generate_batch(prompts: List[str], seed: int) -> List[str]
-    Detects if model_path is a LoRA adapter (presence of adapter_config.json).
+    Detects if model_path is a LoRA adapter (presence of adapter_config.json) and uses vLLM.
     """
     import os
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+
     is_lora = os.path.exists(os.path.join(model_path, "adapter_config.json"))
 
     if is_lora and base_model is None:
@@ -82,26 +91,22 @@ def _load_hf_generator(model_path: str, base_model: Optional[str]):
     tok.padding_side = "left"
 
     if is_lora:
-        from peft import PeftModel, PeftConfig
-        base = AutoModelForCausalLM.from_pretrained(
-            base_model, 
-            dtype=torch.bfloat16, 
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True, 
-            device_map="auto"
-        )
-        model = PeftModel.from_pretrained(base, model_path)
-        # Optionally merge for a tiny generation speed boost:
-        # model = model.merge_and_unload()
+        llm = LLM(model=base_model, tokenizer=tok, dtype=base_model.dtype, enable_lora=True)
+        try:
+            llm.load_lora_adapter("adapter", model_path)
+        except AttributeError:
+            try:
+                llm.add_lora_adapter("adapter", model_path)
+            except Exception as e:
+                raise RuntimeError(f"Unable to load LoRA adapter with vLLM: {e}")
+        try:
+            from vllm.lora.request import LoRARequest
+            lora_request = LoRARequest("adapter", adapter_id=1)
+        except Exception as e:
+            raise RuntimeError(f"vLLM LoRARequest import failed. Please update vLLM. Error: {e}")
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, 
-            dtype=torch.bfloat16, 
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True,
-            device_map="auto"
-        )
-    model.eval()
+        llm = LLM(model=model_path, tokenizer=tok, dtype=base_model.dtype, seed=seed)
+        lora_request = None
 
     def generate_batch(
         prompts: List[str],
@@ -111,8 +116,6 @@ def _load_hf_generator(model_path: str, base_model: Optional[str]):
         max_new_tokens: int = 1024,
         gen_bs: int = 8,
     ) -> List[str]:
-        import torch
-
         # Build chat-formatted prompts
         texts: List[str] = []
         for p in prompts:
@@ -122,28 +125,24 @@ def _load_hf_generator(model_path: str, base_model: Optional[str]):
             ]
             texts.append(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
 
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+            n=1,
+            seed=seed,
+        )
+
         outputs: List[str] = []
 
         for i in tqdm(range(0, len(texts), gen_bs), desc="prompts", leave=False):
             chunk = texts[i : i + gen_bs]
-            batch = tok(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
-            with torch.inference_mode():
-                out = model.generate(
-                    **batch,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_new_tokens=max_new_tokens,
-                    eos_token_id=tok.eos_token_id,
-                    pad_token_id=tok.pad_token_id,
-                    use_cache=True
-                )
-
-            lens = batch["attention_mask"].sum(dim=1).tolist()
-            for j in range(out.shape[0]):
-                start = lens[j]
-                gen_ids = out[j, start:]
-                outputs.append(tok.decode(gen_ids, skip_special_tokens=True))
+            if lora_request is not None:
+                results = llm.generate(chunk, sampling_params, lora_request=lora_request)
+            else:
+                results = llm.generate(chunk, sampling_params)
+            for r in results:
+                outputs.append(r.outputs[0].text)
 
         return outputs
 
@@ -219,13 +218,13 @@ def check_after_fraction_mapping(extracted_answer: str, gold: str) -> bool:
 
 
 # ---------- AIME24 Avg@N ----------
-def run_aime24_avgN(model_path: str, out_dir: str, n_seeds: int = 64, base_model: Optional[str] = None) -> float:
+def run_aime24_avgN(model_path: str, out_dir: str, n_seeds: List[int] = [121, 131, 141, 151, 161, 171, 181, 191], base_model: Optional[str] = None) -> float:
     os.makedirs(out_dir, exist_ok=True)
     ds = load_dataset("HuggingFaceH4/aime_2024", split="train", cache_dir=CACHE_DIR)
     problems = [r["problem"] for r in ds]
     answers  = [f'{int(r["answer"]):03d}' for r in ds]
 
-    gen = _load_hf_generator(model_path, base_model)
+    gen = _load_vllm_generator(model_path, base_model)
 
     # reference-style patterns
     pattern1_re = re.compile(r"\\boxed\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}", re.DOTALL)
@@ -236,7 +235,7 @@ def run_aime24_avgN(model_path: str, out_dir: str, n_seeds: int = 64, base_model
 
     per_seed_acc: List[float] = []
     per_seed_matrix: List[List[int]] = []
-    for seed in tqdm(range(n_seeds), desc="seeds"):
+    for seed in tqdm(n_seeds, desc="seeds"):
         preds = gen(problems, seed=seed, temperature=0.6, top_p=0.95, max_new_tokens=1024, gen_bs=8)
         correct_vec: List[int] = []
         for p, g in zip(preds, answers):
@@ -283,20 +282,22 @@ def run_aime24_avgN(model_path: str, out_dir: str, n_seeds: int = 64, base_model
     avgN = float(np.mean(per_seed_acc))
     # Persist results
     with open(os.path.join(out_dir, "aime24_summary.json"), "w") as f:
-        json.dump({"avg_at_n": avgN, "n": n_seeds, "per_seed": per_seed_acc}, f, indent=2)
+        json.dump({"avg_at_n": avgN, "n": len(n_seeds), "per_seed": per_seed_acc}, f, indent=2)
     with open(os.path.join(out_dir, "aime24_correct_matrix.csv"), "w", newline="") as f:
         w = csv.writer(f); w.writerow(["problem_idx"] + [f"seed_{i}" for i in range(n_seeds)])
         for i in range(len(problems)):
-            w.writerow([i] + [per_seed_matrix[s][i] for s in range(n_seeds)])
+            w.writerow([i] + [per_seed_matrix[s][i] for s in range(len(n_seeds))])
 
-    print(f"[AIME24] Avg@{n_seeds}: {avgN:.2f}%  →  {out_dir}")
+    print(f"[AIME24] Avg@{len(n_seeds)}: {avgN:.2f}%  →  {out_dir}")
     return avgN
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--out_dir", required=True)
-    ap.add_argument("--n_seeds", type=int, default=64)
+    ap.add_argument("--seeds", type=str, default="121 131 141 151 161 171 181 191")
     ap.add_argument("--base_model", default=None, help="Required if model_path is a LoRA adapter dir.")
     args = ap.parse_args()
-    run_aime24_avgN(args.model_path, args.out_dir, n_seeds=args.n_seeds, base_model=args.base_model)
+
+    n_seeds = [int(seed) for seed in args.seeds.split(" ")]
+    run_aime24_avgN(args.model_path, args.out_dir, n_seeds=n_seeds, base_model=args.base_model)

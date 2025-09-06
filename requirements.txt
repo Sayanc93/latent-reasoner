@@ -16,3 +16,4 @@ deepspeed
 sympy
 antlr4-python3-runtime
 tqdm
+vllm

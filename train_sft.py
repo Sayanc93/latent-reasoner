@@ -53,7 +53,7 @@ def parse_args():
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
     ap.add_argument("--points_per_epoch", type=int, default=8, help="How many mid-epoch eval points.")
-    ap.add_argument("--n_seeds", type=int, default=64, help="Avg@N seed number")
+    ap.add_argument("--n_seeds", type=str, default="121 131 141 151 161 171 181 191", help="Avg@N seed numbers")
     # performance & MFU
     ap.add_argument("--torch_compile", action="store_true", help="Enable torch.compile (single GPU only).")
     ap.add_argument("--gpu_peak_tflops", type=float, default=989.0, help="Per-GPU BF16 peak TFLOPS (H100≈989).")
@@ -114,11 +114,11 @@ class EvalOnSave(TrainerCallback):
       2) run AIME24 Avg@N using aime_eval_lib.run_aime24_avgN
       3) append (global_step, fractional_epoch, avg@N) into a CSV
     """
-    def __init__(self, run_dir: str, base_model: str, n_seeds: int, steps_per_epoch: int):
+    def __init__(self, run_dir: str, base_model: str, seeds: List[int], steps_per_epoch: int):
         super().__init__()
         self.run_dir = run_dir
         self.base_model = base_model
-        self.n_seeds = n_seeds
+        self.seeds = n_seeds
         self.steps_per_epoch = max(1, steps_per_epoch)
         self.csv_path = os.path.join(run_dir, "aime24_points.csv")
         # init CSV header
@@ -140,7 +140,7 @@ class EvalOnSave(TrainerCallback):
         from eval.aime_eval_lib import run_aime24_avgN
 
         # If this is LoRA, last_ckpt contains adapters; pass base_model
-        avgN = run_aime24_avgN(last_ckpt, eval_out, n_seeds=1, base_model=self.base_model)
+        avgN = run_aime24_avgN(last_ckpt, eval_out, seeds=self.n_seeds, base_model=self.base_model)
 
         frac_epoch = state.global_step / self.steps_per_epoch
         with open(self.csv_path, "a", newline="") as f:
@@ -338,6 +338,8 @@ if __name__ == "__main__":
         gpu_peak_tflops=args.gpu_peak_tflops,
     )
 
+    n_seeds = [int(seed) for seed in args.n_seeds.split(" ")]
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -348,7 +350,7 @@ if __name__ == "__main__":
             perf_cb,
             EvalOnSave(run_dir=args.out_dir,
                        base_model=args.base_model,
-                       n_seeds=args.n_seeds,
+                       seeds=n_seeds,
                        steps_per_epoch=steps_per_epoch)
         ]
     )
