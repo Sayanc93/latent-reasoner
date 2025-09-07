@@ -36,6 +36,8 @@ from peft import LoraConfig, get_peft_model
 import torch
 import time
 from typing import List
+import wandb
+import numpy as np
 
 CACHE_DIR = f"{os.getcwd()}/cache"
 
@@ -46,12 +48,12 @@ def parse_args():
     ap.add_argument("--base_model", default="Qwen/Qwen2.5-3B-Instruct")
     ap.add_argument("--out_dir", default=f"{os.getcwd()}/sft_output")
     ap.add_argument("--epochs", type=int, default=6)
-    ap.add_argument("--per_device_bs", type=int, default=1)
-    ap.add_argument("--grad_accum", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--per_device_bs", type=int, default=8)
+    ap.add_argument("--grad_accum", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
-    ap.add_argument("--points_per_epoch", type=int, default=8, help="How many mid-epoch eval points.")
+    ap.add_argument("--points_per_epoch", type=int, default=4, help="How many mid-epoch eval points.")
     ap.add_argument("--n_seeds", type=str, default="121 131 141 151 161 171 181 191", help="Avg@N seed numbers")
     # performance & MFU
     ap.add_argument("--torch_compile", action="store_true", help="Enable torch.compile (single GPU only).")
@@ -142,7 +144,7 @@ class EvalOnSave(TrainerCallback):
         avgN = run_aime24_avgN(
             last_ckpt,
             eval_out,
-            seeds=self.seeds,
+            n_seeds=self.seeds,
             base_model=self.base_model)
 
         frac_epoch = state.global_step / self.steps_per_epoch
@@ -238,6 +240,13 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join(args.out_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    wandb.init(
+        project=os.environ.get("WANDB_PROJECT", "latent-reasoner-sft"), 
+        name=f"sft_{args.base_model}", 
+        dir=args.out_dir,
+        config=vars(args)
+    )
+
     # Enable TF32 on H100 for faster matmuls (safe with BF16 training)
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -252,9 +261,13 @@ if __name__ == "__main__":
         dataset = ds_raw["train"]
     else:
         dataset = ds_raw
-    tok = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
-    max_len = tok.model_max_length * 4 # for yarn rope scaling
+    if "resp_len" in dataset.column_names:
+        dataset = dataset.sort("resp_len")
+
+    tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
+
+    max_len = tok.model_max_length
     # def _map(ex):
     #     return build_chat(tok, ex["input"], ex["output"], max_len=max_len)
 
@@ -271,13 +284,7 @@ if __name__ == "__main__":
     )
     # Only compile on single GPU to avoid incompatibilities with DDP/FSDP and device sharding
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if args.torch_compile and world_size == 1:
-        try:
-            model = torch.compile(model, mode="max-autotune")
-            print("[PERF] torch.compile enabled (mode=max-autotune)")
-        except Exception as e:
-            print(f"[PERF] torch.compile disabled due to error: {e}")
-    
+
     if args.lora_r and args.lora_r > 0:
         lora_cfg = LoraConfig(
             r=args.lora_r, 
@@ -301,7 +308,7 @@ if __name__ == "__main__":
         grad_accum=args.grad_accum,
         world_size=world_size,
     )
-    save_steps = max(1, steps_per_epoch // max(1, args.points_per_epoch))
+    save_steps = max(1, steps_per_epoch//4)
     print(f"[CONFIG] steps_per_epoch≈{steps_per_epoch}  save_steps={save_steps}  (points_per_epoch={args.points_per_epoch})")
 
     # Prefer fused AdamW on Hopper; fall back to paged AdamW 8bit if LoRA requested
@@ -317,22 +324,30 @@ if __name__ == "__main__":
         bf16=args.bf16,
         fp16=False,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-        logging_steps=min(50, save_steps),
+        warmup_ratio=0.1,
+        torch_compile=args.torch_compile, # only single GPU
+        logging_steps=10,
         save_strategy="steps",
-        save_steps=2,
-        save_total_limit=1000,  # keep many mid-epoch ckpts; prune later if needed
-        report_to=[],
+        save_steps=save_steps,
+        report_to=["wandb"],
         gradient_checkpointing=True,
         optim=chosen_optim,
-        max_grad_norm=1.0,
-        dataloader_num_workers=os.cpu_count(),
-        ddp_find_unused_parameters=False,
+        resume_from_checkpoint=True,
+        max_grad_norm=0.7,
+        weight_decay=0.01,
+        dataloader_num_workers=2,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
+        save_safetensors=True,
+        torch_empty_cache_steps=100,
         remove_unused_columns=False,
+        run_name=f"sft_{args.base_model}_1",
+        use_liger_kernel=True,
     )
 
     # Perf monitor (tokens/s, TFLOPS, MFU)
-    seq_len_for_mfu = args.seq_len_for_mfu or max_len
+    avg_len = int(np.mean(dataset["resp_len"])) if "resp_len" in dataset.column_names else max_len
+    seq_len_for_mfu = args.seq_len_for_mfu or avg_len
     perf_cb = PerfMonitor(
         per_device_bs=args.per_device_bs,
         grad_accum=args.grad_accum,
@@ -351,10 +366,10 @@ if __name__ == "__main__":
         data_collator=make_collate_build_chat(tok, max_len),
         callbacks=[
             perf_cb,
-            EvalOnSave(run_dir=args.out_dir,
-                       base_model=args.base_model,
-                       seeds=n_seeds,
-                       steps_per_epoch=steps_per_epoch)
+            # EvalOnSave(run_dir=args.out_dir,
+            #            base_model=args.base_model,
+            #            seeds=n_seeds,
+            #            steps_per_epoch=steps_per_epoch)
         ]
     )
 

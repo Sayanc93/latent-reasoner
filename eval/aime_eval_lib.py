@@ -68,7 +68,7 @@ CACHE_DIR = f"{os.getcwd()}/cache"
 
 # ---------- Model loading (full or LoRA) ----------
 
-def _load_vllm_generator(model_path: str, base_model: Optional[str], model_type: str, max_new_tokens: int):
+def _load_vllm_generator(model_path: str, base_model: Optional[str], model_type: str, max_new_tokens: int, gen_bs: int):
     """
     Returns generate_batch(prompts: List[str], seed: int) -> List[str]
     Detects if model_path is a LoRA adapter (presence of adapter_config.json) and uses vLLM.
@@ -92,7 +92,14 @@ def _load_vllm_generator(model_path: str, base_model: Optional[str], model_type:
         except Exception as e:
             raise RuntimeError(f"vLLM LoRARequest import failed. Please update vLLM. Error: {e}")
     else:
-        llm = LLM(model=model_path, tokenizer=tok_model_path, cache_dir=CACHE_DIR)
+        llm = LLM(
+            model=model_path, 
+            tokenizer=tok_model_path, 
+            dtype="bfloat16",
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            max_num_seqs=gen_bs,
+        )
         lora_request = None
 
     def generate_batch(
@@ -100,7 +107,6 @@ def _load_vllm_generator(model_path: str, base_model: Optional[str], model_type:
         seed: int,
         temperature: float = 0.6,
         top_p: float = 0.95,
-        gen_bs: int = 8,
     ) -> List[str]:
         # Build AceReason-style prompts
         texts: List[str] = [build_prompt(p, model_type=model_type) for p in prompts]
@@ -115,15 +121,10 @@ def _load_vllm_generator(model_path: str, base_model: Optional[str], model_type:
 
         outputs: List[str] = []
 
-        for i in tqdm(range(0, len(texts), gen_bs), desc="prompts", leave=False):
-            chunk = texts[i : i + gen_bs]
-            if lora_request is not None:
-                results = llm.generate(chunk, sampling_params, lora_request=lora_request)
-            else:
-                results = llm.generate(chunk, sampling_params)
-            for r in results:
-                outputs.append(_trim_special_end_tokens(r.outputs[0].text))
-
+        results = llm.generate(texts, sampling_params)
+        for r in results:
+            outputs.append(_trim_special_end_tokens(r.outputs[0].text))
+        
         return outputs
 
     return generate_batch
@@ -215,7 +216,13 @@ def run_aime24_avgN(
     problems = [r["problem"] for r in ds]
     answers  = [f'{int(r["answer"]):03d}' for r in ds]
 
-    gen = _load_vllm_generator(model_path, base_model, model_type=model_type, max_new_tokens=max_new_tokens)
+    gen = _load_vllm_generator(
+        model_path, 
+        base_model, 
+        model_type=model_type, 
+        max_new_tokens=max_new_tokens,
+        gen_bs=gen_bs
+    )
 
     # reference-style patterns
     pattern1_re = re.compile(r"\\boxed\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}", re.DOTALL)
@@ -226,13 +233,12 @@ def run_aime24_avgN(
 
     per_seed_acc: List[float] = []
     per_seed_matrix: List[List[int]] = []
-    for seed in tqdm(n_seeds, desc="seeds"):
+    for seed in tqdm(n_seeds, desc="seeds", leave=False):
         preds = gen(
             problems,
             seed=seed,
             temperature=temperature,
-            top_p=top_p,
-            gen_bs=gen_bs
+            top_p=top_p
         )
         correct_vec: List[int] = []
         for p, g in zip(preds, answers):
@@ -292,13 +298,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--out_dir", required=True)
-    ap.add_argument("--seeds", type=str, default="121 131 141 151 161 171 181 191")
+    ap.add_argument("--seeds", type=str, default="100 200 300 400 500 600 700 800")
     ap.add_argument("--base_model", default=None, help="Required if model_path is a LoRA adapter dir.")
     ap.add_argument("--dataset_name", default="HuggingFaceH4/aime_2024")
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--top_p", type=float, default=0.95)
     ap.add_argument("--gen_bs", type=int, default=8)
-    ap.add_argument("--model_type", type=str, default="qwen", choices=["qwen", "r1"])
+    ap.add_argument("--model_type", type=str, default="qwen", choices=["qwen"])
     ap.add_argument("--max_new_tokens", type=int, default=32768)
     args = ap.parse_args()
 
