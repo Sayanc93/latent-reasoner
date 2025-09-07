@@ -48,9 +48,9 @@ def parse_args():
     ap.add_argument("--base_model", default="Qwen/Qwen2.5-3B-Instruct")
     ap.add_argument("--out_dir", default=f"{os.getcwd()}/sft_output")
     ap.add_argument("--epochs", type=int, default=6)
-    ap.add_argument("--per_device_bs", type=int, default=8)
+    ap.add_argument("--per_device_bs", type=int, default=4)
     ap.add_argument("--grad_accum", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
     ap.add_argument("--points_per_epoch", type=int, default=4, help="How many mid-epoch eval points.")
@@ -333,8 +333,8 @@ if __name__ == "__main__":
         gradient_checkpointing=True,
         optim=chosen_optim,
         resume_from_checkpoint=True,
-        max_grad_norm=0.7,
-        weight_decay=0.01,
+        max_grad_norm=1.0,
+        weight_decay=0.03,
         dataloader_num_workers=2,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
