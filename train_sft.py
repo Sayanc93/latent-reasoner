@@ -332,13 +332,23 @@ if __name__ == "__main__":
 
     # 5) Rotate each epoch
     class RotatePerPrompt(TrainerCallback):
-        def __init__(self, base_ds): 
+        def __init__(self, trainer, base_ds, make_indices):
+            self.trainer = trainer
             self.base_ds = base_ds
+            self.make_indices = make_indices
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            ids = self.make_indices(0)
+            self.trainer.train_dataset = self.base_ds.select(ids)
+            control.should_rebuild_dataloaders = True
+            return control
 
         def on_epoch_begin(self, args, state, control, **kwargs):
-            current_epoch = int(state.epoch or 0)
-            kwargs["trainer"].train_dataset = self.base_ds.select(make_epoch_indices(current_epoch))
+            e = int(state.epoch or 0)
+            ids = self.make_indices(e)
+            self.trainer.train_dataset = self.base_ds.select(ids)
             control.should_rebuild_dataloaders = True
+            return control
 
     # Prefer fused AdamW on Hopper; fall back to paged AdamW 8bit if LoRA requested
     use_bnb = bool(args.lora_r and args.lora_r > 0)
@@ -395,12 +405,14 @@ if __name__ == "__main__":
         data_collator=make_collate_build_chat(tok, max_len),
         callbacks=[
             perf_cb,
-            RotatePerPrompt(orig_ds),
             # EvalOnSave(run_dir=args.out_dir,
             #            base_model=args.base_model,
             #            seeds=n_seeds,
             #            steps_per_epoch=steps_per_epoch)
         ]
     )
+
+    if args.rotate_one_per_prompt:
+        trainer.add_callback(RotatePerPrompt(trainer, orig_ds, make_epoch_indices))
 
     trainer.train()
