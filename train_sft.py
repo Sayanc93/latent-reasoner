@@ -10,7 +10,7 @@ Key ideas:
 Usage:
   accelerate launch train_sft.py \
     --dataset_name shockroborty/acereason_v7_math_multiresponse \
-    --base_model Qwen/Qwen2.5-3B-Instruct \
+    --base_model Qwen/Qwen2.5-Math-7B \
     --out_dir sft_output \
     --epochs 6 \
     --per_device_bs 1 \
@@ -38,6 +38,7 @@ import time
 from typing import List
 import wandb
 import numpy as np
+from collections import defaultdict
 
 CACHE_DIR = f"{os.getcwd()}/cache"
 
@@ -45,12 +46,12 @@ CACHE_DIR = f"{os.getcwd()}/cache"
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset_name", default="shockroborty/acereason_v7_math_multiresponse")
-    ap.add_argument("--base_model", default="Qwen/Qwen2.5-3B-Instruct")
+    ap.add_argument("--base_model", default="Qwen/Qwen2.5-Math-7B")
     ap.add_argument("--out_dir", default=f"{os.getcwd()}/sft_output")
     ap.add_argument("--epochs", type=int, default=6)
-    ap.add_argument("--per_device_bs", type=int, default=4)
-    ap.add_argument("--grad_accum", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--per_device_bs", type=int, default=2)
+    ap.add_argument("--grad_accum", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
     ap.add_argument("--points_per_epoch", type=int, default=4, help="How many mid-epoch eval points.")
@@ -72,7 +73,7 @@ def build_chat(tokenizer, user_text: str, assistant_text: str, max_len: int):
 
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     # toks = tokenizer(text, truncation=True, max_length=max_len)
-    toks = tokenizer(text, truncation=True)
+    toks = tokenizer(text, truncation=True, max_length=max_len)
     input_ids = toks["input_ids"]
 
     # Prefix up to the start of assistant (includes assistant preamble for clean boundary)
@@ -267,12 +268,6 @@ if __name__ == "__main__":
 
     tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
 
-    max_len = tok.model_max_length
-    # def _map(ex):
-    #     return build_chat(tok, ex["input"], ex["output"], max_len=max_len)
-
-    # dataset = dataset.map(_map, remove_columns=dataset.column_names, desc="Tokenizing", num_proc=os.cpu_count(), cache_dir=CACHE_DIR)
-
     # Model (full or LoRA)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -281,7 +276,12 @@ if __name__ == "__main__":
         dtype=torch.bfloat16 if args.bf16 else torch.float16,
         cache_dir=CACHE_DIR,
         low_cpu_mem_usage=True,
+        rope_scaling={"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
+        max_position_embeddings=131072,
     )
+
+    max_len = model.config.max_position_embeddings
+    
     # Only compile on single GPU to avoid incompatibilities with DDP/FSDP and device sharding
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
@@ -302,8 +302,38 @@ if __name__ == "__main__":
         )
         model = get_peft_model(model, lora_cfg)
 
+    # Build {prompt_hash: [row_ids]}
+    grp = defaultdict(list)
+    for i, h in enumerate(dataset["prompt_hash"]):
+        grp[h].append(i)
+    unique_prompt_count = len(grp)
+
+    def make_epoch_indices(epoch: int):
+        ids = []
+        for _, rows in grp.items():
+            j = epoch % len(rows)
+            ids.append(rows[j])
+        np.random.shuffle(ids)
+        return ids
+
+    class RotatingPromptSubset(torch.utils.data.Dataset):
+        def __init__(self, base_ds):
+            self.base = base_ds
+            self._epoch = 0
+            self._ids = make_epoch_indices(self._epoch)
+        def set_epoch(self, e: int):
+            self._epoch = e
+            self._ids = make_epoch_indices(self._epoch)
+        def __len__(self):
+            return len(self._ids)
+        def __getitem__(self, idx):
+            return self.base[int(self._ids[idx])]
+
+    view_ds = RotatingPromptSubset(dataset)
+
+    # recompute steps per epoch based on unique prompts (not total rows)
     steps_per_epoch = compute_steps_per_epoch(
-        num_rows=len(dataset),
+        num_rows=unique_prompt_count,
         per_device_bs=args.per_device_bs,
         grad_accum=args.grad_accum,
         world_size=world_size,
@@ -324,7 +354,7 @@ if __name__ == "__main__":
         bf16=args.bf16,
         fp16=False,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.1,
+        warmup_ratio=0.03,
         torch_compile=args.torch_compile, # only single GPU
         logging_steps=10,
         save_strategy="steps",
@@ -358,14 +388,24 @@ if __name__ == "__main__":
 
     n_seeds = [int(seed) for seed in args.n_seeds.split(" ")]
 
+    class RotatePerEpoch(TrainerCallback):
+        def __init__(self, ds_view: RotatingPromptSubset):
+            self.ds_view = ds_view
+            self.epoch = 0
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            if state.epoch is not None:
+                self.epoch = int(state.epoch)
+            self.ds_view.set_epoch(self.epoch)
+
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=view_ds,
         processing_class=tok,
         data_collator=make_collate_build_chat(tok, max_len),
         callbacks=[
             perf_cb,
+            RotatePerEpoch(view_ds),
             # EvalOnSave(run_dir=args.out_dir,
             #            base_model=args.base_model,
             #            seeds=n_seeds,
