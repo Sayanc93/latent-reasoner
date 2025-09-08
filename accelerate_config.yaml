@@ -1,12 +1,14 @@
 compute_environment: LOCAL_MACHINE
 debug: true
-distributed_type: NO
+distributed_type: DEEPSPEED
+deepspeed_config:
+ deepspeed_config_file: ./ds_config.json
 downcast_bf16: 'no'
 enable_cpu_affinity: false
 machine_rank: 0
 main_training_function: main
 num_machines: 1
-num_processes: 1 # set to number of gpus
+num_processes: 2 # set to number of gpus
 rdzv_backend: static
 same_network: true
 tpu_env: []

@@ -50,8 +50,8 @@ def parse_args():
     ap.add_argument("--base_model", default="Qwen/Qwen2.5-Math-7B")
     ap.add_argument("--out_dir", default=f"{os.getcwd()}/sft_output")
     ap.add_argument("--epochs", type=int, default=6)
-    ap.add_argument("--per_device_bs", type=int, default=2)
-    ap.add_argument("--grad_accum", type=int, default=16)
+    ap.add_argument("--per_device_bs", type=int, default=1)
+    ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
@@ -238,6 +238,7 @@ def compute_steps_per_epoch(num_rows: int, per_device_bs: int, grad_accum: int, 
 # ----------- Main -----------
 if __name__ == "__main__":
     args = parse_args()
+    print(args)
     os.makedirs(args.out_dir, exist_ok=True)
     ckpt_dir = os.path.join(args.out_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -274,8 +275,7 @@ if __name__ == "__main__":
         dtype=torch.bfloat16 if args.bf16 else torch.float16,
         cache_dir=CACHE_DIR,
         low_cpu_mem_usage=True,
-        rope_scaling={"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
-        max_position_embeddings=131072,
+        use_cache=False,
     )
 
     print(f"Model config: {model.config}")
@@ -337,17 +337,12 @@ if __name__ == "__main__":
             self.base_ds = base_ds
             self.make_indices = make_indices
 
-        def on_train_begin(self, args, state, control, **kwargs):
-            ids = self.make_indices(0)
-            self.trainer.train_dataset = self.base_ds.select(ids)
-            control.should_rebuild_dataloaders = True
-            return control
-
         def on_epoch_begin(self, args, state, control, **kwargs):
             e = int(state.epoch or 0)
             ids = self.make_indices(e)
             self.trainer.train_dataset = self.base_ds.select(ids)
             control.should_rebuild_dataloaders = True
+            print(f"[CONFIG] num_rows_epoch={len(self.trainer.train_dataset)}")
             return control
 
     # Prefer fused AdamW on Hopper; fall back to paged AdamW 8bit if LoRA requested
@@ -374,14 +369,14 @@ if __name__ == "__main__":
         resume_from_checkpoint=True,
         max_grad_norm=1.0,
         weight_decay=0.03,
-        dataloader_num_workers=2,
+        dataloader_num_workers=4,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
         save_safetensors=True,
         torch_empty_cache_steps=100,
         remove_unused_columns=False,
         run_name=f"sft_{args.base_model}_{acc.process_index}",
-        use_liger_kernel=True,
+        use_liger_kernel=True
     )
 
     # Perf monitor (tokens/s, TFLOPS, MFU)
@@ -412,7 +407,6 @@ if __name__ == "__main__":
         ]
     )
 
-    if args.rotate_one_per_prompt:
-        trainer.add_callback(RotatePerPrompt(trainer, orig_ds, make_epoch_indices))
+    trainer.add_callback(RotatePerPrompt(trainer, orig_ds, make_epoch_indices))
 
     trainer.train()
