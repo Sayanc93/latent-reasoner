@@ -39,6 +39,7 @@ from typing import List
 import wandb
 import numpy as np
 from collections import defaultdict
+from accelerate import Accelerator
 
 CACHE_DIR = f"{os.getcwd()}/cache"
 
@@ -241,12 +242,16 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join(args.out_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    wandb.init(
-        project=os.environ.get("WANDB_PROJECT", "latent-reasoner-sft"), 
-        name=f"sft_{args.base_model}", 
-        dir=args.out_dir,
-        config=vars(args)
-    )
+    acc = Accelerator()
+    
+    if acc.is_main_process:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "latent-reasoner-sft"), 
+            name=f"sft_{args.base_model}", 
+            dir=args.out_dir,
+            config=vars(args),
+            group="latent-reasoner-sft"
+        )
 
     # Enable TF32 on H100 for faster matmuls (safe with BF16 training)
     try:
@@ -256,24 +261,11 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    ds_raw = load_dataset(args.dataset_name, cache_dir=CACHE_DIR)  # columns: input, output, prompt_hash, resp_len
-    # Pick the train split if a DatasetDict is returned
-    if isinstance(ds_raw, DatasetDict):
-        dataset = ds_raw["train"]
-    else:
-        dataset = ds_raw
-
-    if "resp_len" in dataset.column_names:
-        dataset = dataset.sort("resp_len")
+    orig_ds = load_dataset(args.dataset_name, split="train", cache_dir=CACHE_DIR, num_proc=os.cpu_count())  # columns: input, output, prompt_hash, resp_len
 
     tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
 
     max_len = tok.model_max_length
-    # def _map(ex):
-    #     return build_chat(tok, ex["input"], ex["output"], max_len=max_len)
-
-    # dataset = dataset.map(_map, remove_columns=dataset.column_names, desc="Tokenizing", num_proc=os.cpu_count(), cache_dir=CACHE_DIR)
-
     # Model (full or LoRA)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -285,8 +277,11 @@ if __name__ == "__main__":
         rope_scaling={"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
         max_position_embeddings=131072,
     )
+
+    print(f"Model config: {model.config}")
+    
     # Only compile on single GPU to avoid incompatibilities with DDP/FSDP and device sharding
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    world_size = acc.num_processes
 
     if args.lora_r and args.lora_r > 0:
         lora_cfg = LoraConfig(
@@ -304,8 +299,6 @@ if __name__ == "__main__":
             ]
         )
         model = get_peft_model(model, lora_cfg)
-
-    orig_ds = dataset
 
     # 1) Group rows by prompt
     grp = defaultdict(list)
@@ -377,7 +370,7 @@ if __name__ == "__main__":
         save_safetensors=True,
         torch_empty_cache_steps=100,
         remove_unused_columns=False,
-        run_name=f"sft_{args.base_model}_1",
+        run_name=f"sft_{args.base_model}_{acc.process_index}",
         use_liger_kernel=True,
     )
 
