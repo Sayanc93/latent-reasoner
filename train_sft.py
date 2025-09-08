@@ -31,7 +31,7 @@ import math
 import csv
 from datasets import load_dataset, DatasetDict
 from transformers import (AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments,
-                          default_data_collator, TrainerCallback)
+                          TrainerCallback)
 from peft import LoraConfig, get_peft_model
 import torch
 import time
@@ -268,6 +268,12 @@ if __name__ == "__main__":
 
     tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
 
+    max_len = tok.model_max_length
+    # def _map(ex):
+    #     return build_chat(tok, ex["input"], ex["output"], max_len=max_len)
+
+    # dataset = dataset.map(_map, remove_columns=dataset.column_names, desc="Tokenizing", num_proc=os.cpu_count(), cache_dir=CACHE_DIR)
+
     # Model (full or LoRA)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -279,9 +285,6 @@ if __name__ == "__main__":
         rope_scaling={"type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
         max_position_embeddings=131072,
     )
-
-    max_len = model.config.max_position_embeddings
-    
     # Only compile on single GPU to avoid incompatibilities with DDP/FSDP and device sharding
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
@@ -302,44 +305,47 @@ if __name__ == "__main__":
         )
         model = get_peft_model(model, lora_cfg)
 
-    # Build {prompt_hash: [row_ids]}
-    grp = defaultdict(list)
-    for i, h in enumerate(dataset["prompt_hash"]):
-        grp[h].append(i)
-    unique_prompt_count = len(grp)
+    orig_ds = dataset
 
+    # 1) Group rows by prompt
+    grp = defaultdict(list)
+    for i, h in enumerate(orig_ds["prompt_hash"]):
+        grp[h].append(i)
+    keys = grp.keys()
+
+    # 2) Per-prompt quota: ceil(Rh / E)
+    quota = {h: max(1, math.ceil(len(grp[h]) / args.epochs)) for h in keys}
+
+    # 3) Build rotating indices per epoch
     def make_epoch_indices(epoch: int):
         ids = []
-        for _, rows in grp.items():
-            j = epoch % len(rows)
-            ids.append(rows[j])
-        np.random.shuffle(ids)
+        for h in keys:
+            rows = grp[h]
+            q = quota[h]
+            start = (epoch * q) % len(rows)
+            for t in range(q):
+                ids.append(rows[(start + t) % len(rows)])
+        np.random.default_rng(epoch).shuffle(ids)  # mix batches
         return ids
 
-    class RotatingPromptSubset(torch.utils.data.Dataset):
-        def __init__(self, base_ds):
-            self.base = base_ds
-            self._epoch = 0
-            self._ids = make_epoch_indices(self._epoch)
-        def set_epoch(self, e: int):
-            self._epoch = e
-            self._ids = make_epoch_indices(self._epoch)
-        def __len__(self):
-            return len(self._ids)
-        def __getitem__(self, idx):
-            return self.base[int(self._ids[idx])]
+    # 4) Initial subset and steps/epoch
+    ids0 = make_epoch_indices(0)
+    dataset = orig_ds.select(ids0)
+    num_rows_epoch = sum(quota.values())
+    steps_per_epoch = compute_steps_per_epoch(num_rows_epoch, args.per_device_bs, args.grad_accum, world_size)
+    save_steps = max(1, steps_per_epoch // max(1, args.points_per_epoch))
 
-    view_ds = RotatingPromptSubset(dataset)
-
-    # recompute steps per epoch based on unique prompts (not total rows)
-    steps_per_epoch = compute_steps_per_epoch(
-        num_rows=unique_prompt_count,
-        per_device_bs=args.per_device_bs,
-        grad_accum=args.grad_accum,
-        world_size=world_size,
-    )
-    save_steps = max(1, steps_per_epoch//4)
     print(f"[CONFIG] steps_per_epoch≈{steps_per_epoch}  save_steps={save_steps}  (points_per_epoch={args.points_per_epoch})")
+
+    # 5) Rotate each epoch
+    class RotatePerPrompt(TrainerCallback):
+        def __init__(self, base_ds): 
+            self.base_ds = base_ds
+
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            current_epoch = int(state.epoch or 0)
+            kwargs["trainer"].train_dataset = self.base_ds.select(make_epoch_indices(current_epoch))
+            control.should_rebuild_dataloaders = True
 
     # Prefer fused AdamW on Hopper; fall back to paged AdamW 8bit if LoRA requested
     use_bnb = bool(args.lora_r and args.lora_r > 0)
@@ -388,24 +394,15 @@ if __name__ == "__main__":
 
     n_seeds = [int(seed) for seed in args.n_seeds.split(" ")]
 
-    class RotatePerEpoch(TrainerCallback):
-        def __init__(self, ds_view: RotatingPromptSubset):
-            self.ds_view = ds_view
-            self.epoch = 0
-        def on_epoch_begin(self, args, state, control, **kwargs):
-            if state.epoch is not None:
-                self.epoch = int(state.epoch)
-            self.ds_view.set_epoch(self.epoch)
-
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=view_ds,
+        train_dataset=dataset,
         processing_class=tok,
         data_collator=make_collate_build_chat(tok, max_len),
         callbacks=[
             perf_cb,
-            RotatePerEpoch(view_ds),
+            RotatePerPrompt(orig_ds),
             # EvalOnSave(run_dir=args.out_dir,
             #            base_model=args.base_model,
             #            seeds=n_seeds,
