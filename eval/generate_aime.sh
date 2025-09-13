@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DIR='pwd'
+DIR="$PWD"
 
 CHECKPOINT_DIR=$1
 TOKENIZER_DIR=$1

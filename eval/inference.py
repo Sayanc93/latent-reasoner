@@ -115,8 +115,8 @@ def get_prompt_list(args):
 
 def main():
     args = get_args(add_evaluation=True)
-    # if args.device_id:
-    #     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
+    if args.device_id:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
 
     for key, value in vars(args).items():
         print(f"{key}: {value}")

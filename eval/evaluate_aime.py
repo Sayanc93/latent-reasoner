@@ -495,7 +495,7 @@ def evaluate_gpqa(input_datapath, test_datapath):
 def get_args():
     parser = argparse.ArgumentParser(description="Evaluation")
     parser.add_argument("--modelfolder", type=str, default=None, help="model_folder")
-    parser.add_argument("--test_data", type=str, default=None, help="test data path")
+    parser.add_argument("--dataset", type=str, default=None, help="test data path")
     args = parser.parse_args()
     return args
 
@@ -503,7 +503,7 @@ def main():
     args = get_args()
 
     model_folder = args.modelfolder
-    test_datapath = args.test_data
+    test_datapath = args.dataset
 
     # Get all prediction files from model folder
     input_datapaths = glob.glob(os.path.join(model_folder, "seed*.jsonl"))
