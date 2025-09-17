@@ -369,14 +369,14 @@ if __name__ == "__main__":
         resume_from_checkpoint=True,
         max_grad_norm=1.0,
         weight_decay=0.03,
-        dataloader_num_workers=4,
-        dataloader_pin_memory=True,
-        dataloader_persistent_workers=True,
+        # dataloader_num_workers=4,
+        # dataloader_pin_memory=True,
+        # dataloader_persistent_workers=True,
         save_safetensors=True,
         torch_empty_cache_steps=100,
         remove_unused_columns=False,
         run_name=f"sft_{args.base_model}_{acc.process_index}",
-        use_liger_kernel=True
+        # use_liger_kernel=True
     )
 
     # Perf monitor (tokens/s, TFLOPS, MFU)
@@ -409,4 +409,4 @@ if __name__ == "__main__":
 
     trainer.add_callback(RotatePerPrompt(trainer, orig_ds, make_epoch_indices))
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=f"{ckpt_dir}/checkpoint-16191")

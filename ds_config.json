@@ -5,8 +5,7 @@
     "contiguous_gradients": true,
     "reduce_scatter": true,
     "offload_optimizer": {
-      "device": "cpu",
-      "pin_memory": true
+      "device": "cpu"
     }
   },
   "bf16": { "enabled": true },
