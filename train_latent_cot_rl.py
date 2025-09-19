@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-GSPO/GRPO + Coconut-style Latent Steps on GSM8K (minimal, readable)
+GSPO/GRPO + Coconut-style Latent Steps on nvidia/AceReason-Math dataset
 -------------------------------------------------------------------
 """
 
@@ -16,51 +16,39 @@ from datasets import load_dataset, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 from trl import GRPOTrainer, GRPOConfig  # swap with GSPO trainer if available
-from sampling import sample_from_logits
 
-CACHE_DIR = "cache"
+from sampling import sample_from_logits
+from eval.evaluate_aime import math_answer_cleaning, round_number, is_equal_after_calculation, check_after_fraction_mapping
+from eval.tools.grader import math_equal
+
+CACHE_DIR = f"{os.getcwd()}/cache"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
 
 # ---------------------------- Special tokens ---------------------------- #
 
-THINK_OPEN   = "<thinking>"
-THINK_CLOSE  = "</thinking>"
+THINK_OPEN   = "<think>"
+THINK_CLOSE  = "</think>"
 LATENT_OPEN  = "<latent>"
 LATENT_CLOSE = "</latent>"
-ANS_OPEN     = "<answer>"
-ANS_CLOSE    = "</answer>"
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. The reasoning process and the final answer are enclosed within "
-    "<thinking> </thinking> and <answer> </answer> tags, respectively. "
-    "You may use <latent> </latent> blocks inside <thinking> </thinking> to ponder.\n"
-    "Respond STRICTLY in this XML format.\n"
-)
+SYSTEM_PROMPT = """<|im_start|>system
+You are a helpful and harmless assistant. You should think step-by-step.
+<|im_end|>
+<|im_start|>user
+{question}
 
-NUMERIC = re.compile(r"[-+]?\d+(?:\.\d+)?")
-ANS_BLOCK = re.compile(r"(?is)<answer>\s*(.*?)\s*</answer>")
+Please place your final answer inside \\boxed{{}}.
+<|im_end|>
+<|im_start|>assistant
+<think>"""
 
-def _to_number(s: str) -> Optional[float]:
-    try:
-        s = s.replace(",", "").replace("$", "").strip()
-        if s == "":
-            return None
-        return float(s)
-    except Exception:
-        return None
-
-def extract_pred_number(text: str) -> Optional[str]:
-    """Extract the final numeric answer; prefer inside <answer>...</answer>."""
-    m = ANS_BLOCK.search(text)
-    blob = m.group(1) if m else text
-    nums = NUMERIC.findall(blob.replace(",", ""))
-    return nums[-1] if nums else None
 
 # ---------------------------- Tokenizer helpers ---------------------------- #
 
 def add_special_tokens(tokenizer, model: PreTrainedModel) -> Dict[str, int]:
     added = tokenizer.add_special_tokens(
-        {"additional_special_tokens": [THINK_OPEN, THINK_CLOSE, LATENT_OPEN, LATENT_CLOSE, ANS_OPEN, ANS_CLOSE]}
+        {"additional_special_tokens": [THINK_OPEN, THINK_CLOSE, LATENT_OPEN, LATENT_CLOSE]}
     )
     if added > 0:
         model.resize_token_embeddings(len(tokenizer))
@@ -68,42 +56,11 @@ def add_special_tokens(tokenizer, model: PreTrainedModel) -> Dict[str, int]:
         "latent_open": tokenizer.convert_tokens_to_ids(LATENT_OPEN),
         "latent_close": tokenizer.convert_tokens_to_ids(LATENT_CLOSE),
         "think_open": tokenizer.convert_tokens_to_ids(THINK_OPEN),
-        "think_close": tokenizer.convert_tokens_to_ids(THINK_CLOSE),
-        "ans_open": tokenizer.convert_tokens_to_ids(ANS_OPEN),
-        "ans_close": tokenizer.convert_tokens_to_ids(ANS_CLOSE),
+        "think_close": tokenizer.convert_tokens_to_ids(THINK_CLOSE)
     }
     for k, v in ids.items():
         assert v is not None and v >= 0, f"Missing special token id for {k}"
     return ids
-
-# ---------------------------- Data ---------------------------- #
-
-def extract_gsm8k_gold(s: str) -> Optional[str]:
-    # GSM8K gold is after '####'
-    if "####" not in s:
-        return None
-    raw = s.split("####")[-1].strip()
-    nums = NUMERIC.findall(raw.replace(",", "").replace("$", ""))
-    return nums[-1] if nums else None
-
-def build_gsm8k_split(tokenizer: AutoTokenizer, split: str = "train") -> Dataset:
-    ds = load_dataset("openai/gsm8k", "main", split=split, cache_dir=CACHE_DIR)
-
-    def _row_to_prompt(row: Dict[str, Any]) -> Dict[str, Any]:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": row["question"].strip()},
-        ]
-        if hasattr(tokenizer, "apply_chat_template"):
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        else:
-            prompt = SYSTEM_PROMPT + "\nUser: " + row["question"].strip() + "\nAssistant:"
-        gold = extract_gsm8k_gold(row["answer"])
-        return {"prompt": prompt, "answer": gold}
-
-    return ds.map(_row_to_prompt, remove_columns=ds.column_names)
 
 # ---------------------------- Latent Generator ---------------------------- #
 
@@ -195,7 +152,7 @@ class LatentReasoningGenerator:
                         logits_lat[0], temperature=self.temp, top_p=0.0
                     )
 
-                    if token_id == self.ids["latent_close"]:
+                    if token_id == self.ids["latent_close"] or (eos_id is not None and token_id == eos_id):
                         # CLOSE latent: emit </latent> visibly and append to input_ids
                         trace.append({"type": "visible", "action": "close", "logp": logp_token})
                         text_out.append(self.ids["latent_close"])
@@ -208,8 +165,8 @@ class LatentReasoningGenerator:
                     trace.append({"type": "latent", "action": "continue", "logp": logp_token})
 
 
-            # Stop on </answer> or EOS
-            if token_id == self.ids["ans_close"] or (eos_id is not None and token_id == eos_id):
+            # Stop on EOS
+            if eos_id is not None and token_id == eos_id:
                 break
 
         text = self.tok.decode(text_out, skip_special_tokens=False)
@@ -221,7 +178,8 @@ class LatentReasoningGenerator:
     def generate_batch(self, prompts: List[str]) -> Tuple[List[str], List[List[int]], List[Dict[str,int]]]:
         outs, ids, stats = [], [], []
         for p in prompts:
-            out = self.generate_one(p)
+            system_prompt_prefix_text = SYSTEM_PROMPT.format(question=p)
+            out = self.generate_one(system_prompt_prefix_text)
             txt, tr = out["text"], out["trace"]
             outs.append(txt)
             ids.append(self.tok(txt, add_special_tokens=False).input_ids)
@@ -229,7 +187,6 @@ class LatentReasoningGenerator:
         return outs, ids, stats
 
 # ---------------------------- TRL GRPO Trainer wrapper ---------------------------- #
-
 class LatentReasoningTrainer(GRPOTrainer):
     """
     Wrap TRL's GRPOTrainer to:
@@ -258,60 +215,51 @@ class LatentReasoningTrainer(GRPOTrainer):
         return completions, completion_ids
 
 # ---------------------------- Reward functions ---------------------------- #
+# Format check regex for <think> ... </think>
+THINK_BLOCK = re.compile(r"(?is)<think>\s*(.*?)\s*</think>")
 
-# #Compute compute-aware numeric rewards (correctness + structure - compute)
-# def compute_rewards(self, *, prompts=None, completions=None, completions_ids=None, **kwargs):
-#     golds = kwargs.get("answer", [None] * len(completions))
-#     rewards = []
-#     for txt, gold, st in zip(completions, golds, self._latest_latent_stats):
-#         pred_str = extract_pred_number(txt)
-#         gold_val = _to_number(gold) if gold is not None else None
-#         pred_val = _to_number(pred_str) if pred_str is not None else None
+# Extraction patterns for final boxed answer (matches AIME-style formats)
+_BOXED_P1 = re.compile(r"\\boxed\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}", re.DOTALL)
+_BOXED_P2 = re.compile(r"\*\*(.*?)\*\*", re.DOTALL)
+_BOXED_P3 = re.compile(r"\\\[\n(.*?)\n\\\]", re.DOTALL)
+_BOXED_P4 = re.compile(r"is \\\((.*?)\\\)")
+_BOXED_P5 = re.compile(r"\\\[\\n(.*?)\\n\\\]")
 
-#         correct = 1.0 if (gold_val is not None and pred_val is not None and abs(pred_val - gold_val) < 1e-6) else 0.0
-#         structure = 0.2 if (THINK_OPEN in txt and THINK_CLOSE in txt and ANS_OPEN in txt and ANS_CLOSE in txt) else 0.0
-#         r = 2.0 * correct + structure - self.lam_visible * st["n_visible"] - self.lam_latent * st["n_latent"]
-#         rewards.append(float(r))
-#     return rewards
-
-# Format check regex for <thinking> ... </thinking>
-THINK_BLOCK = re.compile(r"(?is)<thinking>\s*(.*?)\s*</thinking>")
-
-def _has_well_formed_xml(text: str) -> bool:
-    t = THINK_BLOCK.search(text)
-    a = ANS_BLOCK.search(text)
-    if not (t and a):
-        return False
-    return bool(t.group(1).strip()) and bool(a.group(1).strip())
+def extract_final_answer(text: str) -> Optional[str]:
+    for pattern in (_BOXED_P1, _BOXED_P2, _BOXED_P3, _BOXED_P4, _BOXED_P5):
+        match = pattern.search(text)
+        if match:
+            return match[-1]
+    return None
 
 def reward_format(*, completions=None, **kwargs):
-    # +0.2 if both <thinking>...</thinking> and <answer>...</answer> blocks exist and are non-empty
+    # +0.2 if both <think>...</think> and pattern matched answer blocks exist and are non-empty
     scores = []
     for txt in completions:
-        scores.append(0.2 if _has_well_formed_xml(txt[0]) else 0.0)
+        has_think_block = THINK_BLOCK.search(txt) is not None
+        has_boxed_block = extract_final_answer(txt) is not None
+        scores.append(0.5 if has_think_block and has_boxed_block else 0.0)
     return scores
-
-def strict_format_reward(*, completions=None, **kwargs):
-    """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<thinking>\n.*?\n</thinking>\n<answer>\n.*?\n</answer>\n$"
-    responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r, flags=re.DOTALL) for r in responses] 
-    return [0.5 if match else 0.0 for match in matches]
-
-def int_reward(*, completions=None, **kwargs):
-    responses = [completion[0]['content'] for completion in completions]
-    extracted_responses = [ANS_BLOCK.search(r) for r in responses]
-    return [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
 
 def reward_accuracy(*, completions=None, answer=None, **kwargs):
     # +2.0 if numeric answer matches gold (within tolerance)
     golds = answer or [None] * len(completions)
     scores = []
     for txt, gold in zip(completions, golds):
-        pred_str = extract_pred_number(txt[0])
-        gold_val = _to_number(gold) if gold is not None else None
-        pred_val = _to_number(pred_str) if pred_str is not None else None
-        scores.append(2.0 if gold_val is not None and pred_val is not None and pred_val == gold_val else 0.0)
+        pred = extract_final_answer(txt)
+        if pred is None or gold is None:
+            scores.append(0.0)
+            continue
+        pred = math_answer_cleaning(pred)
+        gold = math_answer_cleaning(gold)
+       
+        ok = (
+            math_equal(pred, gold) or
+            round_number(pred) == round_number(gold) or
+            is_equal_after_calculation(pred, gold) or
+            check_after_fraction_mapping(pred, gold)
+        )
+        scores.append(2.0 if ok else 0.0)
     return scores
 
 def reward_compute_penalty(*, completions=None, latent_stats=None, lam_visible=1e-4, lam_latent=2e-4, **kwargs):
@@ -374,16 +322,27 @@ def main():
         tok.pad_token = tok.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_id, cache_dir=CACHE_DIR, torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None
-    ).to(DEVICE)
+        args.model_id, 
+        cache_dir=CACHE_DIR, 
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+        device_map="auto"
+    )
 
     special_ids = add_special_tokens(tok, model)
     train_ds = build_gsm8k_split(tok, split="train")
 
     # Optional KL ref (frozen snapshot)
     ref_model = AutoModelForCausalLM.from_pretrained(
-        args.model_id, cache_dir=CACHE_DIR, torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None
-    ).to(DEVICE)
+        args.model_id, 
+        cache_dir=CACHE_DIR, 
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+        device_map="auto"
+    )
+
+    assert model.device == ref_model.device
+    assert DEVICE == model.device
+    assert DEVICE == ref_model.device
+
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad_(False)

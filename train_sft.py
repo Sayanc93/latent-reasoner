@@ -109,52 +109,6 @@ def make_collate_build_chat(tokenizer, max_len: int):
         return padded
     return collate_fn
 
-# ----------- Eval-on-save callback -----------
-class EvalOnSave(TrainerCallback):
-    """
-    On each save (every save_steps), we:
-      1) detect the just-written checkpoint dir
-      2) run AIME24 Avg@N using aime_eval_lib.run_aime24_avgN
-      3) append (global_step, fractional_epoch, avg@N) into a CSV
-    """
-    def __init__(self, run_dir: str, base_model: str, seeds: List[int], steps_per_epoch: int):
-        super().__init__()
-        self.run_dir = run_dir
-        self.base_model = base_model
-        self.seeds = seeds
-        self.steps_per_epoch = max(1, steps_per_epoch)
-        self.csv_path = os.path.join(run_dir, "aime24_points.csv")
-        # init CSV header
-        if not os.path.exists(self.csv_path):
-            with open(self.csv_path, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["global_step", "fractional_epoch", "avg_at_n"])
-
-    def on_save(self, args, state, control, **kwargs):
-        last_ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-        if not os.path.exists(last_ckpt):
-            return
-
-        # Eval
-        eval_out = os.path.join(self.run_dir, "evals", f"step_{state.global_step}")
-        os.makedirs(eval_out, exist_ok=True)
-
-        # Lazy import to avoid circular import at module load
-        from eval.aime_eval_lib import run_aime24_avgN
-
-        # If this is LoRA, last_ckpt contains adapters; pass base_model
-        avgN = run_aime24_avgN(
-            last_ckpt,
-            eval_out,
-            n_seeds=self.seeds,
-            base_model=self.base_model)
-
-        frac_epoch = state.global_step / self.steps_per_epoch
-        with open(self.csv_path, "a", newline="") as f:
-            csv.writer(f).writerow([state.global_step, f"{frac_epoch:.3f}", f"{avgN:.2f}"])
-        print(f"step={state.global_step}  epoch~{frac_epoch:.3f}  AIME24 Avg@{len(self.seeds)}={avgN:.2f}%")
-
-
 class PerfMonitor(TrainerCallback):
     """Tracks throughput and approximates MFU (Nanogpt-style: flops/token≈6*n_params).
 
@@ -399,11 +353,7 @@ if __name__ == "__main__":
         processing_class=tok,
         data_collator=make_collate_build_chat(tok, max_len),
         callbacks=[
-            perf_cb,
-            # EvalOnSave(run_dir=args.out_dir,
-            #            base_model=args.base_model,
-            #            seeds=n_seeds,
-            #            steps_per_epoch=steps_per_epoch)
+            perf_cb
         ]
     )
 
