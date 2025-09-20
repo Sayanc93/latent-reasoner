@@ -42,6 +42,8 @@ from collections import defaultdict
 from accelerate import Accelerator
 
 CACHE_DIR = f"{os.getcwd()}/cache"
+torch.manual_seed(42)
+np.random.seed(42)
 
 # ----------- CLI -----------
 def parse_args():
@@ -326,6 +328,8 @@ if __name__ == "__main__":
         # dataloader_num_workers=4,
         # dataloader_pin_memory=True,
         # dataloader_persistent_workers=True,
+        seed=42,
+        data_seed=42,
         save_safetensors=True,
         torch_empty_cache_steps=100,
         remove_unused_columns=False,

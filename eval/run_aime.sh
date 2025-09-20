@@ -12,7 +12,7 @@ MODEL_TYPE="qwen"
 # for seed in ${seed_list_aime24[@]}; do
 #     bash generate_aime.sh ${MODEL_NAME} ${seed} aime24 ${OUTPUT_FOLDER_NAME}/aime24 ${MODEL_TYPE}
 # done
-python evaluate_aime.py --modelfolder ${OUTPUT_FOLDER_NAME}/aime24 --dataset data/aime24.jsonl
+# python evaluate_aime.py --modelfolder ${OUTPUT_FOLDER_NAME}/aime24 --dataset data/aime24.jsonl
 
 
 # AIME 25
