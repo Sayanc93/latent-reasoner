@@ -32,6 +32,7 @@ import csv
 from datasets import load_dataset, DatasetDict
 from transformers import (AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments,
                           TrainerCallback)
+from trl import SFTConfig, SFTTrainer
 from peft import LoraConfig, get_peft_model
 import torch
 import time
@@ -53,12 +54,11 @@ def parse_args():
     ap.add_argument("--out_dir", default=f"{os.getcwd()}/sft_output")
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--per_device_bs", type=int, default=1)
-    ap.add_argument("--grad_accum", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=5e-6)
+    ap.add_argument("--grad_accum", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=6e-6)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
-    ap.add_argument("--points_per_epoch", type=int, default=4, help="How many mid-epoch eval points.")
-    ap.add_argument("--n_seeds", type=str, default="121 131 141 151 161 171 181 191", help="Avg@N seed numbers")
+    ap.add_argument("--points_per_epoch", type=int, default=8, help="How many mid-epoch eval points.")
     # performance & MFU
     ap.add_argument("--torch_compile", action="store_true", help="Enable torch.compile (single GPU only).")
     ap.add_argument("--gpu_peak_tflops", type=float, default=989.0, help="Per-GPU BF16 peak TFLOPS (H100≈989).")
@@ -92,24 +92,6 @@ def build_chat(tokenizer, user_text: str, assistant_text: str, max_len: int):
     labels[len(user_prefix):] = input_ids[len(user_prefix):]
 
     return {"input_ids": input_ids, "attention_mask": toks["attention_mask"], "labels": labels}
-
-def make_collate_build_chat(tokenizer, max_len: int):
-    def collate_fn(batch):
-        feats = [build_chat(tokenizer, ex["input"], ex["output"], max_len=max_len) for ex in batch]
-        base = [{"input_ids": f["input_ids"], "attention_mask": f["attention_mask"]} for f in feats]
-        padded = tokenizer.pad(base, padding=True, return_tensors="pt")
-        max_L = padded["input_ids"].shape[1]
-        lab_batch = []
-        for f in feats:
-            lab = f["labels"]
-            if len(lab) < max_L:
-                lab = lab + [-100] * (max_L - len(lab))
-            else:
-                lab = lab[:max_L]
-            lab_batch.append(lab)
-        padded["labels"] = torch.tensor(lab_batch, dtype=torch.long)
-        return padded
-    return collate_fn
 
 class PerfMonitor(TrainerCallback):
     """Tracks throughput and approximates MFU (Nanogpt-style: flops/token≈6*n_params).
@@ -232,6 +214,8 @@ if __name__ == "__main__":
         cache_dir=CACHE_DIR,
         low_cpu_mem_usage=True,
         use_cache=False,
+        rope_theta=10000,
+        max_position_embeddings=128000
     )
 
     print(f"Model config: {model.config}")
@@ -280,6 +264,7 @@ if __name__ == "__main__":
     # 4) Initial subset and steps/epoch
     ids0 = make_epoch_indices(0)
     dataset = orig_ds.select(ids0)
+    dataset = dataset.rename_columns({"input": "prompt", "output": "completion"})
     num_rows_epoch = sum(quota.values())
     steps_per_epoch = compute_steps_per_epoch(num_rows_epoch, args.per_device_bs, args.grad_accum, world_size)
     save_steps = max(1, steps_per_epoch // max(1, args.points_per_epoch))
@@ -288,15 +273,18 @@ if __name__ == "__main__":
 
     # 5) Rotate each epoch
     class RotatePerPrompt(TrainerCallback):
-        def __init__(self, trainer, base_ds, make_indices):
+        def __init__(self, trainer, base_ds, make_indices, processing_class):
             self.trainer = trainer
             self.base_ds = base_ds
             self.make_indices = make_indices
+            self.processing_class = processing_class
 
         def on_epoch_begin(self, args, state, control, **kwargs):
             e = int(state.epoch or 0)
             ids = self.make_indices(e)
-            self.trainer.train_dataset = self.base_ds.select(ids)
+            ds = self.base_ds.select(ids).rename_columns({"input": "prompt", "output": "completion"})
+            ds = self.trainer._prepare_dataset(ds, self.processing_class, self.trainer.args, self.trainer.args.packing, None, "train")
+            self.trainer.train_dataset = ds
             control.should_rebuild_dataloaders = True
             print(f"[CONFIG] num_rows_epoch={len(self.trainer.train_dataset)}")
             return control
@@ -305,7 +293,7 @@ if __name__ == "__main__":
     use_bnb = bool(args.lora_r and args.lora_r > 0)
     chosen_optim = "paged_adamw_8bit" if use_bnb else "adamw_torch_fused"
 
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=ckpt_dir,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
@@ -314,7 +302,7 @@ if __name__ == "__main__":
         bf16=args.bf16,
         fp16=False,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        warmup_ratio=0.05,
         torch_compile=args.torch_compile, # only single GPU
         logging_steps=10,
         save_strategy="steps",
@@ -325,16 +313,17 @@ if __name__ == "__main__":
         resume_from_checkpoint=True,
         max_grad_norm=1.0,
         weight_decay=0.03,
-        # dataloader_num_workers=4,
-        # dataloader_pin_memory=True,
-        # dataloader_persistent_workers=True,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
         seed=42,
         data_seed=42,
         save_safetensors=True,
+        packing=True,
         torch_empty_cache_steps=100,
-        remove_unused_columns=False,
+        remove_unused_columns=True,
         run_name=f"sft_{args.base_model}_{acc.process_index}",
-        # use_liger_kernel=True
+        use_liger_kernel=True
     )
 
     # Perf monitor (tokens/s, TFLOPS, MFU)
@@ -348,19 +337,16 @@ if __name__ == "__main__":
         gpu_peak_tflops=args.gpu_peak_tflops,
     )
 
-    n_seeds = [int(seed) for seed in args.n_seeds.split(" ")]
-
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         processing_class=tok,
-        data_collator=make_collate_build_chat(tok, max_len),
         callbacks=[
             perf_cb
         ]
     )
 
-    trainer.add_callback(RotatePerPrompt(trainer, orig_ds, make_epoch_indices))
+    trainer.add_callback(RotatePerPrompt(trainer, orig_ds, make_epoch_indices, tok))
 
-    trainer.train(resume_from_checkpoint=f"{ckpt_dir}/checkpoint-16191")
+    trainer.train()
