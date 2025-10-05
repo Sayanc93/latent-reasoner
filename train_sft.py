@@ -36,15 +36,12 @@ from trl import SFTConfig, SFTTrainer
 from peft import LoraConfig, get_peft_model
 import torch
 import time
-from typing import List
 import wandb
 import numpy as np
 from collections import defaultdict
 from accelerate import Accelerator
 
 CACHE_DIR = f"{os.getcwd()}/cache"
-torch.manual_seed(42)
-np.random.seed(42)
 
 # ----------- CLI -----------
 def parse_args():
@@ -54,45 +51,17 @@ def parse_args():
     ap.add_argument("--out_dir", default=f"{os.getcwd()}/sft_output")
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--per_device_bs", type=int, default=1)
-    ap.add_argument("--grad_accum", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=6e-6)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--grad_accum", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
     ap.add_argument("--points_per_epoch", type=int, default=8, help="How many mid-epoch eval points.")
     # performance & MFU
     ap.add_argument("--torch_compile", action="store_true", help="Enable torch.compile (single GPU only).")
-    ap.add_argument("--gpu_peak_tflops", type=float, default=989.0, help="Per-GPU BF16 peak TFLOPS (H100≈989).")
+    ap.add_argument("--gpu_peak_tflops", type=float, default=1979.0, help="Per-GPU BF16 peak TFLOPS (H100≈989).")
     ap.add_argument("--seq_len_for_mfu", type=int, default=None, help="Override seq len used for MFU calc.")
     return ap.parse_args()
-
-# ----------- Data → chat format -----------
-SYSTEM_HINT = None  # keep None; your SFT rows already include reasoning style in outputs
-def build_chat(tokenizer, user_text: str, assistant_text: str, max_len: int):
-    messages = []
-    if SYSTEM_HINT:
-        messages.append({"role":"system","content": SYSTEM_HINT})
-    messages.append({"role":"user","content": user_text})
-    messages.append({"role":"assistant","content": assistant_text})
-
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    # toks = tokenizer(text, truncation=True, max_length=max_len)
-    toks = tokenizer(text, truncation=True, max_length=max_len)
-    input_ids = toks["input_ids"]
-
-    # Prefix up to the start of assistant (includes assistant preamble for clean boundary)
-    messages_u = []
-    if SYSTEM_HINT:
-        messages_u.append({"role":"system","content": SYSTEM_HINT})
-    messages_u.append({"role":"user","content": user_text})
-    user_only = tokenizer.apply_chat_template(messages_u, tokenize=False, add_generation_prompt=True)
-    # user_prefix = tokenizer(user_only, truncation=True, max_length=max_len)["input_ids"]
-    user_prefix = tokenizer(user_only, truncation=True)["input_ids"]
-
-    labels = [-100] * len(input_ids)
-    labels[len(user_prefix):] = input_ids[len(user_prefix):]
-
-    return {"input_ids": input_ids, "attention_mask": toks["attention_mask"], "labels": labels}
-
 class PerfMonitor(TrainerCallback):
     """Tracks throughput and approximates MFU (Nanogpt-style: flops/token≈6*n_params).
 
@@ -177,6 +146,8 @@ def compute_steps_per_epoch(num_rows: int, per_device_bs: int, grad_accum: int, 
 if __name__ == "__main__":
     args = parse_args()
     print(args)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
     ckpt_dir = os.path.join(args.out_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -203,8 +174,16 @@ if __name__ == "__main__":
     orig_ds = load_dataset(args.dataset_name, split="train", cache_dir=CACHE_DIR, num_proc=os.cpu_count())  # columns: input, output, prompt_hash, resp_len
 
     tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
+    # --- SFT hygiene: explicit pad + right padding for causal LM ---
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "right"
+    # --- Minimal, transparent chat template: do NOT hide <thinking>/<answer> ---
+    tok.chat_template = """{% for m in messages -%}
+<|im_start|>{{ m['role'] }}
+{{ m['content'] }}<|im_end|>
+{%- endfor %}"""
 
-    max_len = tok.model_max_length
     # Model (full or LoRA)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -214,9 +193,19 @@ if __name__ == "__main__":
         cache_dir=CACHE_DIR,
         low_cpu_mem_usage=True,
         use_cache=False,
-        rope_theta=10000,
         max_position_embeddings=128000
     )
+
+    # Long-context enablement
+    if hasattr(model.config, "rope_theta"):
+        model.config.rope_theta = 1_000_000          # ~128k effective
+    if hasattr(model.config, "max_position_embeddings"):
+        model.config.max_position_embeddings = max(getattr(model.config, "max_position_embeddings", 0), 131072)
+    
+    # Keep tokenizer/model in sync
+    tok.model_max_length = max(tok.model_max_length, model.config.max_position_embeddings)
+    max_len = tok.model_max_length 
+    assert tok.model_max_length == model.config.max_position_embeddings
 
     print(f"Model config: {model.config}")
     
@@ -240,54 +229,13 @@ if __name__ == "__main__":
         )
         model = get_peft_model(model, lora_cfg)
 
-    # 1) Group rows by prompt
-    grp = defaultdict(list)
-    for i, h in enumerate(orig_ds["prompt_hash"]):
-        grp[h].append(i)
-    keys = grp.keys()
-
-    # 2) Per-prompt quota: ceil(Rh / E)
-    quota = {h: max(1, math.ceil(len(grp[h]) / args.epochs)) for h in keys}
-
-    # 3) Build rotating indices per epoch
-    def make_epoch_indices(epoch: int):
-        ids = []
-        for h in keys:
-            rows = grp[h]
-            q = quota[h]
-            start = (epoch * q) % len(rows)
-            for t in range(q):
-                ids.append(rows[(start + t) % len(rows)])
-        np.random.default_rng(epoch).shuffle(ids)  # mix batches
-        return ids
-
-    # 4) Initial subset and steps/epoch
-    ids0 = make_epoch_indices(0)
-    dataset = orig_ds.select(ids0)
+    # Static blend per AceReason: no per-epoch rotation, just shuffle
+    dataset = orig_ds.shuffle(seed=args.seed)
     dataset = dataset.rename_columns({"input": "prompt", "output": "completion"})
-    num_rows_epoch = sum(quota.values())
+    num_rows_epoch = len(dataset)
     steps_per_epoch = compute_steps_per_epoch(num_rows_epoch, args.per_device_bs, args.grad_accum, world_size)
     save_steps = max(1, steps_per_epoch // max(1, args.points_per_epoch))
-
     print(f"[CONFIG] steps_per_epoch≈{steps_per_epoch}  save_steps={save_steps}  (points_per_epoch={args.points_per_epoch})")
-
-    # 5) Rotate each epoch
-    class RotatePerPrompt(TrainerCallback):
-        def __init__(self, trainer, base_ds, make_indices, processing_class):
-            self.trainer = trainer
-            self.base_ds = base_ds
-            self.make_indices = make_indices
-            self.processing_class = processing_class
-
-        def on_epoch_begin(self, args, state, control, **kwargs):
-            e = int(state.epoch or 0)
-            ids = self.make_indices(e)
-            ds = self.base_ds.select(ids).rename_columns({"input": "prompt", "output": "completion"})
-            ds = self.trainer._prepare_dataset(ds, self.processing_class, self.trainer.args, self.trainer.args.packing, None, "train")
-            self.trainer.train_dataset = ds
-            control.should_rebuild_dataloaders = True
-            print(f"[CONFIG] num_rows_epoch={len(self.trainer.train_dataset)}")
-            return control
 
     # Prefer fused AdamW on Hopper; fall back to paged AdamW 8bit if LoRA requested
     use_bnb = bool(args.lora_r and args.lora_r > 0)
@@ -302,7 +250,7 @@ if __name__ == "__main__":
         bf16=args.bf16,
         fp16=False,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.05,
+        warmup_ratio=0.03,
         torch_compile=args.torch_compile, # only single GPU
         logging_steps=10,
         save_strategy="steps",
@@ -310,20 +258,21 @@ if __name__ == "__main__":
         report_to=["wandb"],
         gradient_checkpointing=True,
         optim=chosen_optim,
-        resume_from_checkpoint=True,
         max_grad_norm=1.0,
         weight_decay=0.03,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
-        seed=42,
-        data_seed=42,
+        seed=args.seed,
+        data_seed=args.seed,
         save_safetensors=True,
-        packing=True,
+        packing=False,
         torch_empty_cache_steps=100,
-        remove_unused_columns=True,
+        remove_unused_columns=False,
         run_name=f"sft_{args.base_model}_{acc.process_index}",
-        use_liger_kernel=True
+        use_liger_kernel=True,
+        eos_token=tok.eos_token,
+        max_seq_length=max_len
     )
 
     # Perf monitor (tokens/s, TFLOPS, MFU)
@@ -337,16 +286,25 @@ if __name__ == "__main__":
         gpu_peak_tflops=args.gpu_peak_tflops,
     )
 
+    # --- SFTTrainer with formatting_func: render chat exactly, no hidden tags ---
+    def formatting_func(examples):
+        texts = []
+        for p, c in zip(examples["prompt"], examples["completion"]):
+            msgs = [{"role":"user","content": p},
+                    {"role":"assistant","content": c}]
+            txt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+            texts.append(txt)
+        return texts
+
+
     trainer = SFTTrainer(
         model=model,
+        processing_class=tok,
         args=training_args,
         train_dataset=dataset,
-        processing_class=tok,
-        callbacks=[
-            perf_cb
-        ]
+        formatting_func=formatting_func,
+        dataset_num_proc=os.cpu_count(),
+        callbacks=[perf_cb],
     )
 
-    trainer.add_callback(RotatePerPrompt(trainer, orig_ds, make_epoch_indices, tok))
-
-    trainer.train()
+    trainer.train(resume_from_checkpoint=True)
