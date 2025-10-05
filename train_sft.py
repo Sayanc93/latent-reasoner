@@ -9,7 +9,7 @@ Key ideas:
 
 Usage:
   accelerate launch train_sft.py \
-    --dataset_name shockroborty/acereason_v7_math_multiresponse \
+    --dataset_name shockroborty/latent-reasoner-sft \
     --base_model Qwen/Qwen2.5-Math-7B \
     --out_dir sft_output \
     --epochs 6 \
@@ -21,8 +21,6 @@ Usage:
 
 Outputs:
   - Checkpoints: out_dir/checkpoints/checkpoint-STEP
-  - Evals:       out_dir/evals/step_{STEP}/aime24_summary.json
-  - CSV of (fractional_epoch, step, avg@64): out_dir/fig6_points.csv
 """
 
 import argparse
@@ -32,7 +30,6 @@ import csv
 from datasets import load_dataset, DatasetDict
 from transformers import (AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments,
                           TrainerCallback)
-from trl import SFTConfig, SFTTrainer
 from peft import LoraConfig, get_peft_model
 import torch
 import time
@@ -40,103 +37,145 @@ import wandb
 import numpy as np
 from collections import defaultdict
 from accelerate import Accelerator
+from dataclasses import dataclass
 
 CACHE_DIR = f"{os.getcwd()}/cache"
 
 # ----------- CLI -----------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset_name", default="shockroborty/acereason_v7_math_multiresponse")
+    ap.add_argument("--dataset_name", default="shockroborty/latent-reasoner-sft")
     ap.add_argument("--base_model", default="Qwen/Qwen2.5-Math-7B")
     ap.add_argument("--out_dir", default=f"{os.getcwd()}/sft_output")
     ap.add_argument("--epochs", type=int, default=6)
-    ap.add_argument("--per_device_bs", type=int, default=1)
+    ap.add_argument("--per_device_bs", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--grad_accum", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--lora_r", type=int, default=0, help="0 disables LoRA (full finetune).")
-    ap.add_argument("--points_per_epoch", type=int, default=8, help="How many mid-epoch eval points.")
+    ap.add_argument("--points_per_epoch", type=int, default=4, help="How many mid-epoch eval points.")
     # performance & MFU
     ap.add_argument("--torch_compile", action="store_true", help="Enable torch.compile (single GPU only).")
-    ap.add_argument("--gpu_peak_tflops", type=float, default=1979.0, help="Per-GPU BF16 peak TFLOPS (H100≈989).")
+    ap.add_argument("--gpu_peak_tflops", type=float, default=1979.0, help="Per-GPU BF16 peak TFLOPS (H200≈1979).")
     ap.add_argument("--seq_len_for_mfu", type=int, default=None, help="Override seq len used for MFU calc.")
     return ap.parse_args()
+
+# ----------- Data → chat format -----------
+def build_chat(tokenizer, user_text: str, assistant_text: str, max_len: int):
+    messages = []
+    messages.append({"role":"user","content": user_text})
+    messages.append({"role":"assistant","content": assistant_text})
+
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    toks = tokenizer(text, truncation=True, max_length=max_len)
+    input_ids = toks["input_ids"]
+
+    # Prefix up to the start of assistant (includes assistant preamble for clean boundary)
+    messages_u = []
+    messages_u.append({"role":"user","content": user_text})
+    user_only = tokenizer.apply_chat_template(messages_u, tokenize=False, add_generation_prompt=True)
+    user_prefix = tokenizer(user_only, truncation=True)["input_ids"]
+
+    labels = [-100] * len(input_ids)
+    labels[len(user_prefix):] = input_ids[len(user_prefix):]
+
+    return {"input_ids": input_ids, "attention_mask": toks["attention_mask"], "labels": labels}
+
+def make_collate_build_chat(tokenizer, max_len: int):
+    def collate_fn(batch):
+        feats = [build_chat(tokenizer, ex["input"], ex["output"], max_len=max_len) for ex in batch]
+        base = [{"input_ids": f["input_ids"], "attention_mask": f["attention_mask"]} for f in feats]
+        padded = tokenizer.pad(base, padding=True, return_tensors="pt")
+        max_L = padded["input_ids"].shape[1]
+        lab_batch = []
+        for f in feats:
+            lab = f["labels"]
+            if len(lab) < max_L:
+                lab = lab + [-100] * (max_L - len(lab))
+            else:
+                lab = lab[:max_L]
+            lab_batch.append(lab)
+        padded["labels"] = torch.tensor(lab_batch, dtype=torch.long)
+        return padded
+    return collate_fn
+    
 class PerfMonitor(TrainerCallback):
     """Tracks throughput and approximates MFU (Nanogpt-style: flops/token≈6*n_params).
 
     Notes:
-    - Uses max_len (or --seq_len_for_mfu) as seq length proxy.
-    - Tokens/sec computed from optimizer steps and gradient accumulation.
+    - Relies on TrainerState.num_input_tokens_seen for true token counts.
+    - Falls back to a heuristic only if token tracking is unavailable.
     - MFU is per-GPU TFLOPS / peak (default peak for H100 BF16 ~989 TFLOPS).
     """
-    def __init__(self, per_device_bs: int, grad_accum: int, world_size: int, seq_len: int, gpu_peak_tflops: float):
+    def __init__(
+        self,
+        per_device_bs: int,
+        grad_accum: int,
+        world_size: int,
+        seq_len: int | None,
+        gpu_peak_tflops: float,
+    ):
         self.per_device_bs = per_device_bs
         self.grad_accum = max(1, grad_accum)
         self.world_size = max(1, world_size)
-        self.seq_len = seq_len
+        self.seq_len = seq_len  # fallback only
         self.gpu_peak_tflops = gpu_peak_tflops
-        self._t0 = None
-        self._last_step = None
-        self._win_time = 0.0
-        self._win_tokens = 0
+        self._last_time = None
         self._n_params = None
-
-    def _tokens_per_optimizer_step(self):
-        return self.per_device_bs * self.grad_accum * self.world_size * self.seq_len
+        self._last_tokens_seen = None
+        self._last_logged_step = 0
 
     def on_train_begin(self, args, state, control, **kwargs):
-        self._t0 = time.perf_counter()
-        self._last_step = 0
-        self._win_time = 0.0
-        self._win_tokens = 0
-
-    def on_step_end(self, args, state, control, **kwargs):
-        now = time.perf_counter()
-        step = state.global_step
-        if self._last_step is None:
-            self._last_step = step
-            self._t0 = now
-            return
-        # steps progressed since last call (normally 1)
-        dstep = max(0, step - self._last_step)
-        dt = max(1e-9, now - self._t0)
-        self._win_time += dt
-        self._win_tokens += dstep * self._tokens_per_optimizer_step()
-        self._t0 = now
-        self._last_step = step
+        self._last_time = time.perf_counter()
+        self._last_tokens_seen = getattr(state, "num_input_tokens_seen", 0)
+        self._last_logged_step = state.global_step
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        # initialize params lazily
+        now = time.perf_counter()
+        if self._last_time is None:
+            self._last_time = now
+
         if self._n_params is None and "model" in kwargs and kwargs["model"] is not None:
             try:
                 self._n_params = sum(p.numel() for p in kwargs["model"].parameters())
             except Exception:
                 self._n_params = None
 
-        # compute deltas since last log
-        dt = max(1e-9, self._win_time)
-        tokens = max(0, self._win_tokens)
-        toks_per_s = tokens / dt if dt > 0 else 0.0
+        dt = max(1e-9, now - self._last_time)
+        step_delta = max(0, state.global_step - self._last_logged_step)
 
-        # FLOPs per token (NanoGPT heuristic): ~6 × number of parameters
+        tokens_seen = getattr(state, "num_input_tokens_seen", None)
+        tokens_delta = 0
+        if tokens_seen is not None and self._last_tokens_seen is not None:
+            tokens_delta = max(0, tokens_seen - self._last_tokens_seen)
+
+        if tokens_delta <= 0 and self.seq_len:
+            tokens_delta = (
+                step_delta
+                * self.per_device_bs
+                * self.grad_accum
+                * self.world_size
+                * self.seq_len
+            )
+
+        toks_per_s = tokens_delta / dt if dt > 0 else 0.0
+
         has_params = self._n_params is not None
         flops_per_token = (6.0 * self._n_params) if has_params else 0.0
-
-        # Cluster TFLOPS, then per-GPU and MFU
         tflops_total = (toks_per_s * flops_per_token) / 1e12
-        tflops_per_gpu = tflops_total / self.world_size  # world_size is clamped ≥ 1
+        tflops_per_gpu = tflops_total / self.world_size
         mfu = tflops_per_gpu / self.gpu_peak_tflops if self.gpu_peak_tflops > 0 else 0.0
-
 
         if logs is not None:
             logs["tokens_per_sec"] = round(toks_per_s, 2)
             logs["tflops_per_gpu"] = round(tflops_per_gpu, 2)
             logs["mfu"] = round(mfu, 4)
 
-        # reset window
-        self._win_tokens = 0
-        self._win_time = 0.0
+        self._last_time = now
+        self._last_logged_step = state.global_step
+        if tokens_seen is not None:
+            self._last_tokens_seen = tokens_seen
 
 def compute_steps_per_epoch(num_rows: int, per_device_bs: int, grad_accum: int, world_size: int) -> int:
     effective_bsz = per_device_bs * max(1, world_size) * grad_accum
@@ -171,18 +210,13 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    orig_ds = load_dataset(args.dataset_name, split="train", cache_dir=CACHE_DIR, num_proc=os.cpu_count())  # columns: input, output, prompt_hash, resp_len
+    dataset = load_dataset(args.dataset_name, split="train", cache_dir=CACHE_DIR, num_proc=os.cpu_count())  # columns: input, output, prompt_hash, resp_len
 
     tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
     # --- SFT hygiene: explicit pad + right padding for causal LM ---
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
-    # --- Minimal, transparent chat template: do NOT hide <thinking>/<answer> ---
-    tok.chat_template = """{% for m in messages -%}
-<|im_start|>{{ m['role'] }}
-{{ m['content'] }}<|im_end|>
-{%- endfor %}"""
 
     # Model (full or LoRA)
     model = AutoModelForCausalLM.from_pretrained(
@@ -192,8 +226,7 @@ if __name__ == "__main__":
         dtype=torch.bfloat16 if args.bf16 else torch.float16,
         cache_dir=CACHE_DIR,
         low_cpu_mem_usage=True,
-        use_cache=False,
-        max_position_embeddings=128000
+        use_cache=False
     )
 
     # Long-context enablement
@@ -229,9 +262,7 @@ if __name__ == "__main__":
         )
         model = get_peft_model(model, lora_cfg)
 
-    # Static blend per AceReason: no per-epoch rotation, just shuffle
-    dataset = orig_ds.shuffle(seed=args.seed)
-    dataset = dataset.rename_columns({"input": "prompt", "output": "completion"})
+    # Static blend per epoch
     num_rows_epoch = len(dataset)
     steps_per_epoch = compute_steps_per_epoch(num_rows_epoch, args.per_device_bs, args.grad_accum, world_size)
     save_steps = max(1, steps_per_epoch // max(1, args.points_per_epoch))
@@ -241,7 +272,7 @@ if __name__ == "__main__":
     use_bnb = bool(args.lora_r and args.lora_r > 0)
     chosen_optim = "paged_adamw_8bit" if use_bnb else "adamw_torch_fused"
 
-    training_args = SFTConfig(
+    training_args = TrainingArguments(
         output_dir=ckpt_dir,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
@@ -252,27 +283,34 @@ if __name__ == "__main__":
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         torch_compile=args.torch_compile, # only single GPU
-        logging_steps=10,
+        logging_steps=20,
         save_strategy="steps",
         save_steps=save_steps,
         report_to=["wandb"],
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={'use_reentrant':False},
         optim=chosen_optim,
+        adam_beta1=0.9,
+        adam_beta2=0.95,
         max_grad_norm=1.0,
         weight_decay=0.03,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
+        dataloader_prefetch_factor=2,
         seed=args.seed,
         data_seed=args.seed,
         save_safetensors=True,
-        packing=False,
         torch_empty_cache_steps=100,
         remove_unused_columns=False,
         run_name=f"sft_{args.base_model}_{acc.process_index}",
         use_liger_kernel=True,
-        eos_token=tok.eos_token,
-        max_seq_length=max_len
+        length_column_name="resp_len",
+        group_by_length=True,
+        include_tokens_per_second=True,
+        include_num_input_tokens_seen="non_padding",
+        hub_strategy="all_checkpoints",
+        hub_model_id="latent-reasoner-sft"
     )
 
     # Perf monitor (tokens/s, TFLOPS, MFU)
@@ -286,25 +324,13 @@ if __name__ == "__main__":
         gpu_peak_tflops=args.gpu_peak_tflops,
     )
 
-    # --- SFTTrainer with formatting_func: render chat exactly, no hidden tags ---
-    def formatting_func(examples):
-        texts = []
-        for p, c in zip(examples["prompt"], examples["completion"]):
-            msgs = [{"role":"user","content": p},
-                    {"role":"assistant","content": c}]
-            txt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
-            texts.append(txt)
-        return texts
-
-
-    trainer = SFTTrainer(
+    trainer = Trainer(
         model=model,
         processing_class=tok,
         args=training_args,
         train_dataset=dataset,
-        formatting_func=formatting_func,
-        dataset_num_proc=os.cpu_count(),
         callbacks=[perf_cb],
+        data_collator=make_collate_build_chat(tok, max(dataset["resp_len"])+2048),
     )
 
-    trainer.train(resume_from_checkpoint=True)
+    trainer.train()
