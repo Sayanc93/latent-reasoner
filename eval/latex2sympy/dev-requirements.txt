@@ -4,7 +4,7 @@
 #
 #    pip-compile dev-requirements.in
 #
-    # via -r dev-requirements.in
+-e .    # via -r dev-requirements.in
 antlr4-python3-runtime==4.11.1
     # via
     #   -r requirements.txt
@@ -31,7 +31,7 @@ pip-tools==4.2.0
     # via -r dev-requirements.in
 pluggy==0.13.0
     # via pytest
-py==1.8.0
+py==1.11.0
     # via pytest
 pycodestyle==2.5.0
     # via
@@ -55,6 +55,3 @@ sympy==1.12
     #   latex2sympy2
 wcwidth==0.1.7
     # via pytest
-
-# THIS MUST BE MAINTAINED AS-IS
--e .
